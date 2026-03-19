@@ -120,8 +120,9 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(0)
         .min(20);
 
-    // Available width for bars (after name + spacing + total number)
-    let bar_width = inner.width.saturating_sub(max_name_len as u16 + 2 + 10) as usize;
+    // Available width for bars (name + space + total + ewma suffix)
+    // Reserve 20 extra chars for " (12.3ms)" suffix and padding
+    let bar_width = inner.width.saturating_sub(max_name_len as u16 + 2 + 8 + 12) as usize;
 
     let mut lines = Vec::new();
     for tube in snap.tubes.iter().take(chart_height) {
