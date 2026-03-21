@@ -2,6 +2,7 @@ use crate::parse::{get_bool, get_f64, get_str, get_u64, parse_yaml_map};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ServerStats {
     pub version: String,
     pub uptime: u64,
@@ -50,6 +51,7 @@ impl ServerStats {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct TubeStats {
     pub name: String,
     pub current_jobs_ready: u64,

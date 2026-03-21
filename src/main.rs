@@ -20,11 +20,11 @@ use tokio::sync::mpsc;
 #[command(name = "tuber-tui", about = "TUI dashboard for tuber job queue")]
 struct Cli {
     /// Tuber server address
-    #[arg(long, default_value = "localhost:11300")]
+    #[arg(short, long, default_value = "localhost:11300")]
     addr: String,
 
     /// Poll interval in seconds
-    #[arg(long, default_value = "1.5")]
+    #[arg(short, long, default_value = "1.5")]
     interval: f64,
 }
 

@@ -124,8 +124,15 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
     // Reserve 20 extra chars for " (12.3ms)" suffix and padding
     let bar_width = inner.width.saturating_sub(max_name_len as u16 + 2 + 8 + 12) as usize;
 
+    let mut sorted_tubes: Vec<&_> = snap.tubes.iter().collect();
+    sorted_tubes.sort_by(|a, b| {
+        let total_a = a.current_jobs_ready + a.current_jobs_reserved + a.current_jobs_delayed + a.current_jobs_buried;
+        let total_b = b.current_jobs_ready + b.current_jobs_reserved + b.current_jobs_delayed + b.current_jobs_buried;
+        total_b.cmp(&total_a)
+    });
+
     let mut lines = Vec::new();
-    for tube in snap.tubes.iter().take(chart_height) {
+    for tube in sorted_tubes.iter().take(chart_height) {
         let name = if tube.name.len() > max_name_len {
             &tube.name[..max_name_len]
         } else {
@@ -154,49 +161,79 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
             continue;
         }
 
-        // log10 scaling for bar segments
-        let log_ready = (ready as f64 + 1.0).log10();
-        let log_reserved = (reserved as f64 + 1.0).log10();
-        let log_delayed = (delayed as f64 + 1.0).log10();
-        let log_buried = (buried as f64 + 1.0).log10();
-        // Subtract the baseline log10(1)=0 for zero counts
-        let log_total = log_ready + log_reserved + log_delayed + log_buried;
+        // Build per-status data: (count, label, fg_color, bg_color)
+        let statuses: [(u64, Color, Color); 4] = [
+            (ready, Color::Black, Color::Green),
+            (reserved, Color::Black, Color::Yellow),
+            (delayed, Color::White, Color::Blue),
+            (buried, Color::White, Color::Red),
+        ];
 
-        let (w_ready, w_reserved, w_delayed, w_buried) = if log_total > 0.0 && bar_width > 0 {
-            let scale = bar_width as f64 / log_total;
-            let wr = (log_ready * scale).round() as usize;
-            let wres = (log_reserved * scale).round() as usize;
-            let wd = (log_delayed * scale).round() as usize;
-            let wb = bar_width.saturating_sub(wr + wres + wd);
-            (wr, wres, wd, wb)
-        } else {
-            (bar_width, 0, 0, 0)
-        };
+        // For each non-zero status, compute label and minimum width
+        let mut segments: Vec<(String, usize, Color, Color)> = Vec::new();
+        let mut log_values: Vec<f64> = Vec::new();
+        for &(count, fg, bg) in &statuses {
+            if count > 0 {
+                let label = format_number(count);
+                let min_w = label.len();
+                segments.push((label, min_w, fg, bg));
+                log_values.push((count as f64 + 1.0).log10());
+            }
+        }
+
+        // Allocate widths: each segment gets at least min_width, remaining space distributed by log10
+        let total_min: usize = segments.iter().map(|(_, mw, _, _)| *mw).sum();
+        let mut widths: Vec<usize> = segments.iter().map(|(_, mw, _, _)| *mw).collect();
+
+        if bar_width > total_min {
+            let remaining = bar_width - total_min;
+            let log_total: f64 = log_values.iter().sum();
+            if log_total > 0.0 {
+                let scale = remaining as f64 / log_total;
+                let mut distributed = 0usize;
+                for (i, lv) in log_values.iter().enumerate() {
+                    if i < widths.len() - 1 {
+                        let extra = (lv * scale).round() as usize;
+                        widths[i] += extra;
+                        distributed += extra;
+                    }
+                }
+                // Give remainder to last segment
+                if let Some(last) = widths.last_mut() {
+                    *last += remaining.saturating_sub(distributed);
+                }
+            }
+        } else if bar_width < total_min && !segments.is_empty() {
+            // Truncate proportionally but ensure at least 1 char per segment
+            let scale = bar_width as f64 / total_min as f64;
+            let mut used = 0usize;
+            for (i, w) in widths.iter_mut().enumerate() {
+                if i < segments.len() - 1 {
+                    *w = (*w as f64 * scale).round().max(1.0) as usize;
+                    used += *w;
+                }
+            }
+            if let Some(last) = widths.last_mut() {
+                *last = bar_width.saturating_sub(used).max(1);
+            }
+        }
 
         let mut spans = vec![Span::styled(padded_name, Style::default().fg(Color::White))];
 
-        if w_ready > 0 {
+        for (i, (label, _min_w, fg, bg)) in segments.iter().enumerate() {
+            let w = widths[i];
+            let text = if w >= label.len() {
+                let pad_total = w - label.len();
+                let pad_left = pad_total / 2;
+                let pad_right = pad_total - pad_left;
+                format!("{}{}{}", " ".repeat(pad_left), label, " ".repeat(pad_right))
+            } else {
+                // Segment too narrow for full label, show what fits
+                label[..w].to_string()
+            };
             spans.push(Span::styled(
-                "█".repeat(w_ready),
-                Style::default().fg(Color::Green),
-            ));
-        }
-        if w_reserved > 0 {
-            spans.push(Span::styled(
-                "█".repeat(w_reserved),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        if w_delayed > 0 {
-            spans.push(Span::styled(
-                "█".repeat(w_delayed),
-                Style::default().fg(Color::Blue),
-            ));
-        }
-        if w_buried > 0 {
-            spans.push(Span::styled(
-                "█".repeat(w_buried),
-                Style::default().fg(Color::Red),
+                text,
+                Style::default().fg(*fg).bg(*bg),
             ));
         }
 
