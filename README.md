@@ -2,7 +2,7 @@
 
 A real-time terminal dashboard for [tuber](https://github.com/dkam/tuber), a Rust job queue server.
 
-![tuber-tui screenshot](screenshots/tui-02.png)
+![tuber-tui screenshot](screenshots/tui-05.png)
 
 ## Features
 
