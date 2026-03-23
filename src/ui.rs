@@ -19,9 +19,16 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let title = match app.current.as_ref().map(|s| s.server.name.as_str()) {
+        Some(name) if !name.is_empty() => {
+            format!(" tuber-tui v{} — {name} ", env!("CARGO_PKG_VERSION"))
+        }
+        _ => format!(" tuber-tui v{} ", env!("CARGO_PKG_VERSION")),
+    };
+
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .title(format!(" tuber-tui v{} ", env!("CARGO_PKG_VERSION")));
+        .title(title);
 
     if let Some(ref err) = app.error {
         let text = vec![
@@ -265,7 +272,7 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
         // EWMA if available
         if tube.processing_time_ewma > 0.0 {
             spans.push(Span::styled(
-                format!(" ({:.1}ms)", tube.processing_time_ewma),
+                format!(" ({:.1}ms)", tube.processing_time_ewma * 1000.0),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -319,7 +326,7 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect) {
             snap.tubes
                 .iter()
                 .filter(|t| t.processing_time_ewma > 0.0)
-                .map(|t| format!("{} {:.1}ms", t.name, t.processing_time_ewma))
+                .map(|t| format!("{} {:.1}ms", t.name, t.processing_time_ewma * 1000.0))
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
