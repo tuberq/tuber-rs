@@ -19,12 +19,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let title = match app.current.as_ref().map(|s| s.server.name.as_str()) {
-        Some(name) if !name.is_empty() => {
-            format!(" tuber-tui v{} — {name} ", env!("CARGO_PKG_VERSION"))
-        }
-        _ => format!(" tuber-tui v{} ", env!("CARGO_PKG_VERSION")),
-    };
+    let title = format!(" tuber-tui v{} ", env!("CARGO_PKG_VERSION"));
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
@@ -58,9 +53,14 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         format!("beanstalkd {}", s.version)
     };
 
+    let server_label = match snap.server.name.as_str() {
+        "" => server_version,
+        name => format!("{server_version} — {name}"),
+    };
+
     let mut line1_spans = vec![
         Span::styled(" ", Style::default().fg(Color::DarkGray)),
-        Span::raw(server_version),
+        Span::raw(server_label),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!("up {uptime}")),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
