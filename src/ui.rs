@@ -12,7 +12,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         .as_ref()
         .map(|s| s.tubes.iter().filter(|t| t.processing_time_ewma > 0.0).count())
         .unwrap_or(0);
-    let bottom_height = 5 + tubes_with_timing as u16;
+    let header_row = if tubes_with_timing > 0 { 1 } else { 0 };
+    let bottom_height = 5 + header_row + tubes_with_timing as u16;
 
     let chunks = Layout::vertical([
         Constraint::Length(4),         // top bar
@@ -349,38 +350,55 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut text = vec![line1, line2];
 
-    for tube in &timing_tubes {
-        let mut spans = vec![
+    if !timing_tubes.is_empty() {
+        let thresh = format_duration(snap.server.processing_time_fast_threshold);
+        let header = Line::from(vec![
             Span::styled(
-                format!(" {:>width$} ", truncate_name(&tube.name, max_name_len), width = max_name_len),
-                Style::default().fg(Color::White),
+                format!(" {:>width$} ", "ewma", width = max_name_len),
+                Style::default().fg(Color::DarkGray),
             ),
-        ];
+            Span::styled(
+                format!("<{thresh} | >{thresh}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("    p50 |   p95 |   p99", Style::default().fg(Color::DarkGray)),
+        ]);
+        text.push(header);
 
-        // Bimodal EWMA
-        spans.push(Span::styled("ewma: ", Style::default().fg(Color::DarkGray)));
-        if tube.processing_time_samples_fast > 0 && tube.processing_time_samples_slow > 0 {
-            spans.push(Span::raw(format!(
-                "{} / {}",
-                format_duration(tube.processing_time_ewma_fast),
-                format_duration(tube.processing_time_ewma_slow),
-            )));
-        } else {
-            spans.push(Span::raw(format_duration(tube.processing_time_ewma)));
+        const DASH: &str = "    \u{2014}"; // right-aligned em-dash, 5 display columns
+        for tube in &timing_tubes {
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {:>width$} ", truncate_name(&tube.name, max_name_len), width = max_name_len),
+                    Style::default().fg(Color::White),
+                ),
+            ];
+
+            // Bimodal EWMA
+            let fast = if tube.processing_time_samples_fast > 0 {
+                format_duration(tube.processing_time_ewma_fast)
+            } else {
+                DASH.to_string()
+            };
+            let slow = if tube.processing_time_samples_slow > 0 {
+                format_duration(tube.processing_time_ewma_slow)
+            } else {
+                DASH.to_string()
+            };
+            spans.push(Span::raw(format!("{} | {}", fast, slow)));
+
+            // Percentiles
+            if tube.processing_time_p50 > 0.0 {
+                spans.push(Span::raw(format!(
+                    "  {} | {} | {}",
+                    format_duration(tube.processing_time_p50),
+                    format_duration(tube.processing_time_p95),
+                    format_duration(tube.processing_time_p99),
+                )));
+            }
+
+            text.push(Line::from(spans));
         }
-
-        // Percentiles
-        if tube.processing_time_p50 > 0.0 {
-            spans.push(Span::styled("  p: ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::raw(format!(
-                "{} / {} / {}",
-                format_duration(tube.processing_time_p50),
-                format_duration(tube.processing_time_p95),
-                format_duration(tube.processing_time_p99),
-            )));
-        }
-
-        text.push(Line::from(spans));
     }
 
     let p = Paragraph::new(text).block(block);
@@ -421,11 +439,12 @@ fn truncate_name(name: &str, max_len: usize) -> &str {
 }
 
 fn format_duration(seconds: f64) -> String {
-    if seconds < 1.0 {
+    let raw = if seconds < 1.0 {
         format!("{:.0}ms", seconds * 1000.0)
     } else {
         format!("{:.1}s", seconds)
-    }
+    };
+    format!("{:>5}", raw)
 }
 
 fn format_number(n: u64) -> String {

@@ -34,6 +34,7 @@ pub struct ServerStats {
     pub hostname: String,
     pub os: String,
     pub platform: String,
+    pub processing_time_fast_threshold: f64,
 }
 
 impl ServerStats {
@@ -70,6 +71,10 @@ impl ServerStats {
             hostname: get_str(&m, "hostname"),
             os: get_str(&m, "os"),
             platform: get_str(&m, "platform"),
+            processing_time_fast_threshold: {
+                let v = get_f64(&m, "processing-time-fast-threshold");
+                if v > 0.0 { v } else { 0.1 }
+            },
         }
     }
 }
