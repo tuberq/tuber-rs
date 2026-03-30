@@ -98,6 +98,7 @@ pub struct TubeStats {
     pub processing_time_p50: f64,
     pub processing_time_p95: f64,
     pub processing_time_p99: f64,
+    pub queue_time_ewma: f64,
     pub cmd_delete: u64,
 }
 
@@ -121,6 +122,7 @@ impl TubeStats {
             processing_time_p50: get_f64(&m, "processing-time-p50"),
             processing_time_p95: get_f64(&m, "processing-time-p95"),
             processing_time_p99: get_f64(&m, "processing-time-p99"),
+            queue_time_ewma: get_f64(&m, "queue-time-ewma"),
             cmd_delete: get_u64(&m, "cmd-delete"),
         }
     }

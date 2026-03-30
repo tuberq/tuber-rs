@@ -351,21 +351,25 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect) {
     let mut text = vec![line1, line2];
 
     if !timing_tubes.is_empty() {
-        let thresh = format_duration(snap.server.processing_time_fast_threshold);
+        let thresh_ms = (snap.server.processing_time_fast_threshold * 1000.0) as u64;
         let header = Line::from(vec![
             Span::styled(
                 format!(" {:>width$} ", "ewma", width = max_name_len),
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                format!("<{thresh} | >{thresh}"),
+                format!("{:>6} | {:>6}", format!("<{}ms", thresh_ms), format!(">{}ms", thresh_ms)),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled("    p50 |   p95 |   p99", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {:>6} | {:>6} | {:>6}", "p50", "p95", "p99"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(format!("  {:>6}", "tiq"), Style::default().fg(Color::DarkGray)),
         ]);
         text.push(header);
 
-        const DASH: &str = "    \u{2014}"; // right-aligned em-dash, 5 display columns
+        const DASH: &str = "     \u{2014}"; // right-aligned em-dash, 6 display columns
         for tube in &timing_tubes {
             let mut spans = vec![
                 Span::styled(
@@ -395,6 +399,11 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect) {
                     format_duration(tube.processing_time_p95),
                     format_duration(tube.processing_time_p99),
                 )));
+            }
+
+            // Time in queue
+            if tube.queue_time_ewma > 0.0 {
+                spans.push(Span::raw(format!("  {}", format_duration(tube.queue_time_ewma))));
             }
 
             text.push(Line::from(spans));
@@ -444,7 +453,7 @@ fn format_duration(seconds: f64) -> String {
     } else {
         format!("{:.1}s", seconds)
     };
-    format!("{:>5}", raw)
+    format!("{:>6}", raw)
 }
 
 fn format_number(n: u64) -> String {
