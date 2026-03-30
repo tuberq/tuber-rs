@@ -362,10 +362,10 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                format!("  {:>6} | {:>6} | {:>6}", "p50", "p95", "p99"),
+                format!(" | {:>6} | {:>6} | {:>6}", "p50", "p95", "p99"),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(format!("  {:>6}", "tiq"), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" | {:>6}", "tiq"), Style::default().fg(Color::DarkGray)),
         ]);
         text.push(header);
 
@@ -394,7 +394,7 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect) {
             // Percentiles
             if tube.processing_time_p50 > 0.0 {
                 spans.push(Span::raw(format!(
-                    "  {} | {} | {}",
+                    " | {} | {} | {}",
                     format_duration(tube.processing_time_p50),
                     format_duration(tube.processing_time_p95),
                     format_duration(tube.processing_time_p99),
@@ -403,7 +403,7 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect) {
 
             // Time in queue
             if tube.queue_time_ewma > 0.0 {
-                spans.push(Span::raw(format!("  {}", format_duration(tube.queue_time_ewma))));
+                spans.push(Span::raw(format!(" | {}", format_duration(tube.queue_time_ewma))));
             }
 
             text.push(Line::from(spans));
