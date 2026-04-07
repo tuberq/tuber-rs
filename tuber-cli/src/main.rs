@@ -93,6 +93,51 @@ enum Command {
         id: u64,
     },
 
+    /// Peek at the next ready job in a tube
+    PeekReady {
+        /// Tube to use
+        #[arg(long, default_value = "default")]
+        tube: String,
+    },
+
+    /// Peek at the next buried job in a tube
+    PeekBuried {
+        /// Tube to use
+        #[arg(long, default_value = "default")]
+        tube: String,
+    },
+
+    /// Peek at the next delayed job in a tube
+    PeekDelayed {
+        /// Tube to use
+        #[arg(long, default_value = "default")]
+        tube: String,
+    },
+
+    /// Show statistics for a job
+    StatsJob {
+        /// Job ID
+        id: u64,
+    },
+
+    /// Show statistics for a job group
+    StatsGroup {
+        /// Group name
+        name: String,
+    },
+
+    /// Delete all jobs in a tube
+    FlushTube {
+        /// Tube name
+        tube: String,
+    },
+
+    /// Delete multiple jobs by ID
+    DeleteBatch {
+        /// Job IDs
+        ids: Vec<u64>,
+    },
+
     /// Bury a reserved job
     Bury {
         /// Job ID
@@ -174,6 +219,60 @@ async fn main() -> anyhow::Result<()> {
         Command::Peek { id } => {
             let (id, body) = client.peek(id).await?;
             output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+        }
+
+        Command::PeekReady { tube } => {
+            if tube != "default" {
+                client.use_tube(&tube).await?;
+            }
+            let (id, body) = client.peek_ready().await?;
+            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+        }
+
+        Command::PeekBuried { tube } => {
+            if tube != "default" {
+                client.use_tube(&tube).await?;
+            }
+            let (id, body) = client.peek_buried().await?;
+            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+        }
+
+        Command::PeekDelayed { tube } => {
+            if tube != "default" {
+                client.use_tube(&tube).await?;
+            }
+            let (id, body) = client.peek_delayed().await?;
+            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+        }
+
+        Command::StatsJob { id } => {
+            let stats = client.stats_job(id).await?;
+            output(&cli.format, &stats)?;
+        }
+
+        Command::StatsGroup { name } => {
+            let stats = client.stats_group(&name).await?;
+            output(&cli.format, &stats)?;
+        }
+
+        Command::FlushTube { tube } => {
+            let count = client.flush_tube(&tube).await?;
+            output(&cli.format, &serde_json::json!({ "flushed": count, "tube": tube }))?;
+        }
+
+        Command::DeleteBatch { ids } => {
+            let mut deleted = Vec::new();
+            let mut errors = Vec::new();
+            for id in &ids {
+                match client.delete(*id).await {
+                    Ok(()) => deleted.push(*id),
+                    Err(e) => errors.push(serde_json::json!({ "id": id, "error": e.to_string() })),
+                }
+            }
+            output(&cli.format, &serde_json::json!({ "deleted": deleted, "errors": errors }))?;
+            if !errors.is_empty() {
+                std::process::exit(1);
+            }
         }
 
         Command::Bury { id, priority } => {

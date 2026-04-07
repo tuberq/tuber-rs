@@ -1,4 +1,4 @@
-use crate::model::{ServerStats, Snapshot, TubeStats};
+use crate::model::{GroupStats, JobStats, ServerStats, Snapshot, TubeStats};
 use crate::parse::parse_yaml_list;
 use std::io;
 use std::time::Instant;
@@ -109,6 +109,47 @@ impl TuberClient {
     pub async fn peek(&mut self, id: u64) -> io::Result<(u64, String)> {
         self.send_line(&format!("peek {id}")).await?;
         self.read_job_response("FOUND").await
+    }
+
+    /// Peek at the next ready job in the currently used tube.
+    pub async fn peek_ready(&mut self) -> io::Result<(u64, String)> {
+        self.send_line("peek-ready").await?;
+        self.read_job_response("FOUND").await
+    }
+
+    /// Peek at the next buried job in the currently used tube.
+    pub async fn peek_buried(&mut self) -> io::Result<(u64, String)> {
+        self.send_line("peek-buried").await?;
+        self.read_job_response("FOUND").await
+    }
+
+    /// Peek at the next delayed job in the currently used tube.
+    pub async fn peek_delayed(&mut self) -> io::Result<(u64, String)> {
+        self.send_line("peek-delayed").await?;
+        self.read_job_response("FOUND").await
+    }
+
+    /// Show statistics for a job by ID.
+    /// Sends: `stats-job <id>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
+    pub async fn stats_job(&mut self, id: u64) -> io::Result<JobStats> {
+        self.send_line(&format!("stats-job {id}")).await?;
+        let body = self.read_ok_body().await?;
+        Ok(JobStats::from_yaml(&body))
+    }
+
+    /// Show statistics for a job group.
+    /// Sends: `stats-group <name>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
+    pub async fn stats_group(&mut self, name: &str) -> io::Result<GroupStats> {
+        self.send_line(&format!("stats-group {name}")).await?;
+        let body = self.read_ok_body().await?;
+        Ok(GroupStats::from_yaml(&body))
+    }
+
+    /// Flush all jobs from a tube.
+    /// Sends: `flush-tube <tube>\r\n` — expects: `FLUSHED <count>\r\n`
+    pub async fn flush_tube(&mut self, tube: &str) -> io::Result<u64> {
+        self.send_line(&format!("flush-tube {tube}")).await?;
+        self.read_u64_response("FLUSHED").await
     }
 
     /// Bury a reserved job.

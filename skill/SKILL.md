@@ -33,6 +33,11 @@ tuber-cli stats-tube default
 
 # Peek at a specific job by ID
 tuber-cli peek 42
+
+# Peek at next ready/buried/delayed job in a tube
+tuber-cli peek-ready --tube series
+tuber-cli peek-buried --tube series
+tuber-cli peek-delayed --tube series
 ```
 
 ### Producing Jobs
@@ -96,10 +101,13 @@ echo -e "list-tubes\r\n" | nc localhost 11300
 # Tube statistics (job counts, paused state, etc.)
 echo -e "stats-tube default\r\n" | nc localhost 11300
 
-# Peek at next ready/delayed/buried job in the current tube
+# Peek at next ready/delayed/buried job (default tube)
 echo -e "peek-ready\r\n" | nc localhost 11300
 echo -e "peek-delayed\r\n" | nc localhost 11300
 echo -e "peek-buried\r\n" | nc localhost 11300
+
+# Peek in a specific tube (use <tube> first)
+printf "use series\r\npeek-buried\r\n" | nc -w 2 localhost 11300
 
 # Peek at a specific job by ID
 echo -e "peek 42\r\n" | nc localhost 11300

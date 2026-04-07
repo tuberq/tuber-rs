@@ -136,6 +136,86 @@ impl TubeStats {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(dead_code)]
+pub struct JobStats {
+    pub id: u64,
+    pub tube: String,
+    pub state: String,
+    pub pri: u64,
+    pub age: u64,
+    pub delay: u64,
+    pub ttr: u64,
+    pub time_left: u64,
+    pub time_reserved: u64,
+    pub reserves: u64,
+    pub timeouts: u64,
+    pub releases: u64,
+    pub buries: u64,
+    pub kicks: u64,
+    pub idempotency_key: String,
+    pub idempotency_ttl: u64,
+    pub group: String,
+    pub after_group: String,
+    pub concurrency_key: String,
+    pub concurrency_limit: u64,
+    pub file: u64,
+}
+
+impl JobStats {
+    pub fn from_yaml(yaml: &str) -> Self {
+        let m = parse_yaml_map(yaml);
+        Self {
+            id: get_u64(&m, "id"),
+            tube: get_str(&m, "tube"),
+            state: get_str(&m, "state"),
+            pri: get_u64(&m, "pri"),
+            age: get_u64(&m, "age"),
+            delay: get_u64(&m, "delay"),
+            ttr: get_u64(&m, "ttr"),
+            time_left: get_u64(&m, "time-left"),
+            time_reserved: get_u64(&m, "time-reserved"),
+            reserves: get_u64(&m, "reserves"),
+            timeouts: get_u64(&m, "timeouts"),
+            releases: get_u64(&m, "releases"),
+            buries: get_u64(&m, "buries"),
+            kicks: get_u64(&m, "kicks"),
+            idempotency_key: get_str(&m, "idempotency-key"),
+            idempotency_ttl: get_u64(&m, "idempotency-ttl"),
+            group: get_str(&m, "group"),
+            after_group: get_str(&m, "after-group"),
+            concurrency_key: get_str(&m, "concurrency-key"),
+            concurrency_limit: get_u64(&m, "concurrency-limit"),
+            file: get_u64(&m, "file"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(dead_code)]
+pub struct GroupStats {
+    pub name: String,
+    pub pending: u64,
+    pub buried: u64,
+    pub complete: bool,
+    pub waiting_jobs: u64,
+}
+
+impl GroupStats {
+    pub fn from_yaml(yaml: &str) -> Self {
+        let m = parse_yaml_map(yaml);
+        Self {
+            name: get_str(&m, "name"),
+            pending: get_u64(&m, "pending"),
+            buried: get_u64(&m, "buried"),
+            complete: get_bool(&m, "complete"),
+            waiting_jobs: get_u64(&m, "waiting-jobs"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Snapshot {
     pub server: ServerStats,
     pub tubes: Vec<TubeStats>,
