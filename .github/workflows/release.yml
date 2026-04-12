@@ -56,13 +56,17 @@ jobs:
           tar czf ../../../tuber-tui-${{ matrix.target }}.tar.gz tuber-tui
           tar czf ../../../tuber-cli-${{ matrix.target }}.tar.gz tuber-cli
           cd ../../..
+          sha256sum tuber-tui-${{ matrix.target }}.tar.gz > tuber-tui-${{ matrix.target }}.tar.gz.sha256
+          sha256sum tuber-cli-${{ matrix.target }}.tar.gz > tuber-cli-${{ matrix.target }}.tar.gz.sha256
 
       - uses: actions/upload-artifact@v6
         with:
           name: tuber-${{ matrix.target }}
           path: |
             tuber-tui-${{ matrix.target }}.tar.gz
+            tuber-tui-${{ matrix.target }}.tar.gz.sha256
             tuber-cli-${{ matrix.target }}.tar.gz
+            tuber-cli-${{ matrix.target }}.tar.gz.sha256
 
   release:
     needs: build
@@ -78,7 +82,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: tuber-*-*.tar.gz
+          files: |
+            tuber-*-*.tar.gz
+            tuber-*-*.tar.gz.sha256
 
   docker:
     runs-on: ubuntu-latest
