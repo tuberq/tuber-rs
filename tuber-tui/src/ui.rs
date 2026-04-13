@@ -98,6 +98,27 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         line2_spans.push(Span::raw(format_bytes(s.rusage_maxrss)));
     }
 
+    if s.max_jobs_size > 0 {
+        let pct = s.current_jobs_size as f64 / s.max_jobs_size as f64 * 100.0;
+        let color = if pct >= 90.0 {
+            Color::Red
+        } else if pct >= 70.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        line2_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        line2_spans.push(Span::styled("Mem: ", Style::default().fg(Color::DarkGray)));
+        line2_spans.push(Span::styled(
+            format!("{} / {} ({:.1}%)", format_bytes(s.current_jobs_size), format_bytes(s.max_jobs_size), pct),
+            Style::default().fg(color),
+        ));
+    } else if s.current_jobs_size > 0 {
+        line2_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        line2_spans.push(Span::styled("Mem: ", Style::default().fg(Color::DarkGray)));
+        line2_spans.push(Span::raw(format_bytes(s.current_jobs_size)));
+    }
+
     line2_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
     line2_spans.push(Span::raw(format!(
         "jobs: {} ready, {} reserved, {} delayed, {} buried",
