@@ -38,6 +38,12 @@ tuber-cli peek 42
 tuber-cli peek-ready --tube series
 tuber-cli peek-buried --tube series
 tuber-cli peek-delayed --tube series
+
+# Job statistics (state, pri, age, TTR, reserves, timeouts, etc.)
+tuber-cli stats-job 42
+
+# Group statistics (debug why aft: jobs aren't running)
+tuber-cli stats-group batch-1
 ```
 
 ### Producing Jobs
@@ -70,6 +76,12 @@ tuber-cli kick 10 --tube emails
 
 # Pause a tube for 60 seconds
 tuber-cli pause emails --delay 60
+
+# Flush all jobs from a tube
+tuber-cli flush-tube mytube
+
+# Delete multiple jobs by ID
+tuber-cli delete-batch 1 2 3 4 5
 ```
 
 ### Global Options
