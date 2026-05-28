@@ -91,6 +91,11 @@ tuber-cli delete-batch 1 2 3 4 5
 -f, --format <FORMAT>  Output format: json (default) or text
 ```
 
+The address can also be set via the `TUBER_ADDR` environment variable (the
+`--addr` flag overrides it). Accepts `host:port`, `host` (port defaults to
+11300), or `:port` (host defaults to localhost). Both `tuber-cli` and
+`tuber-tui` honor it.
+
 ---
 
 ## Using echo + nc (fallback)
