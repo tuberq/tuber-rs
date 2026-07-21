@@ -42,21 +42,37 @@ tuber-cli put --tube emails "send user@example.com"
 # Put from stdin
 echo '{"user": "alice"}' | tuber-cli put --tube notifications
 
+# Tuber extensions: idempotent put, job groups, fan-in, concurrency limits
+tuber-cli put --tube emails --idempotent welcome-42 "send welcome"
+tuber-cli put --tube work --group batch-1 "shard 1"
+tuber-cli put --tube work --after batch-1 "cleanup"
+tuber-cli put --tube work --concurrency user-42 "resize avatar"
+
 # Reserve a job
 tuber-cli reserve --timeout 5
 
 # Delete a job
 tuber-cli delete 42
 
-# Kick buried jobs
+# Kick buried jobs (all, or one by ID)
 tuber-cli kick 10 --tube emails
+tuber-cli kick-job 42
 
 # Peek at a job
 tuber-cli peek 42
 
+# Drain mode: reject new puts, let in-flight work finish
+tuber-cli drain
+tuber-cli undrain
+
 # Text output instead of JSON
 tuber-cli stats --format text
 ```
+
+Note that a reservation belongs to the connection that made it, and each
+`tuber-cli` run is a new connection. So `reserve` then `bury` as two commands
+won't work — the reserve is dropped on exit. Use `tuber-lib` (or one `nc`
+session) to reserve and finish a job together; see `skill/SKILL.md`.
 
 ### Options
 

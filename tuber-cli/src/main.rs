@@ -57,6 +57,27 @@ enum Command {
         /// Time-to-run in seconds
         #[arg(long, default_value = "120")]
         ttr: u32,
+
+        /// Idempotency key: drop the put if a live job with this key exists in
+        /// the tube. Avoid colons in the key -- the last one is read as a TTL.
+        #[arg(long)]
+        idempotent: Option<String>,
+
+        /// Seconds the --idempotent key stays reserved (default: job lifetime)
+        #[arg(long, requires = "idempotent")]
+        idempotent_ttl: Option<u32>,
+
+        /// Add the job to a named group (for fan-out/fan-in)
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Hold the job until the named group completes
+        #[arg(long)]
+        after: Option<String>,
+
+        /// Concurrency key: limit how many jobs with this key run at once
+        #[arg(long)]
+        concurrency: Option<String>,
     },
 
     /// Reserve the next available job
@@ -64,6 +85,20 @@ enum Command {
         /// Timeout in seconds (0 = return immediately if no job)
         #[arg(long, default_value = "0")]
         timeout: u32,
+
+        /// Tube to watch
+        #[arg(long)]
+        tube: Option<String>,
+    },
+
+    /// Reserve up to <count> jobs in a single command
+    ReserveBatch {
+        /// Maximum number of jobs to reserve (1-1000)
+        count: u32,
+
+        /// Seconds to wait for at least one job (omit or 0 = return immediately)
+        #[arg(long)]
+        timeout: Option<u32>,
 
         /// Tube to watch
         #[arg(long)]
@@ -86,6 +121,24 @@ enum Command {
         #[arg(long, default_value = "default")]
         tube: String,
     },
+
+    /// Kick one specific buried or delayed job back to ready
+    KickJob {
+        /// Job ID
+        id: u64,
+    },
+
+    /// Reserve one specific job by ID, ignoring tube and watch list
+    ReserveJob {
+        /// Job ID
+        id: u64,
+    },
+
+    /// Enter drain mode: reject new puts, let in-flight work finish
+    Drain,
+
+    /// Leave drain mode and resume accepting puts
+    Undrain,
 
     /// Peek at a job by ID
     Peek {
@@ -130,6 +183,12 @@ enum Command {
 
     /// Delete all jobs in a tube
     FlushTube {
+        /// Tube name
+        tube: String,
+    },
+
+    /// Delete all buried jobs in a tube (ready/delayed/reserved untouched)
+    FlushBuried {
         /// Tube name
         tube: String,
     },
@@ -183,7 +242,18 @@ async fn main() -> anyhow::Result<()> {
             output(&cli.format, &stats)?;
         }
 
-        Command::Put { body, tube, priority, delay, ttr } => {
+        Command::Put {
+            body,
+            tube,
+            priority,
+            delay,
+            ttr,
+            idempotent,
+            idempotent_ttl,
+            group,
+            after,
+            concurrency,
+        } => {
             client.use_tube(&tube).await?;
             let data = match body {
                 Some(b) => b,
@@ -193,16 +263,51 @@ async fn main() -> anyhow::Result<()> {
                     buf
                 }
             };
-            let id = client.put(priority, delay, ttr, data.as_bytes()).await?;
-            output(&cli.format, &serde_json::json!({ "id": id }))?;
+            let mut tags = Vec::new();
+            if let Some(key) = idempotent {
+                tags.push(match idempotent_ttl {
+                    Some(ttl) => format!("idp:{key}:{ttl}"),
+                    None => format!("idp:{key}"),
+                });
+            }
+            if let Some(g) = group {
+                tags.push(format!("grp:{g}"));
+            }
+            if let Some(a) = after {
+                tags.push(format!("aft:{a}"));
+            }
+            if let Some(c) = concurrency {
+                tags.push(format!("con:{c}"));
+            }
+            let res = client.put_tagged(priority, delay, ttr, data.as_bytes(), &tags).await?;
+            match res.existing_state {
+                // idp: key matched -- nothing was enqueued, id is the existing job.
+                Some(state) => output(
+                    &cli.format,
+                    &serde_json::json!({ "id": res.id, "duplicate": true, "state": state }),
+                )?,
+                None => output(&cli.format, &serde_json::json!({ "id": res.id }))?,
+            }
         }
 
         Command::Reserve { timeout, tube } => {
             if let Some(tube) = tube {
-                client.use_tube(&tube).await?;
+                client.watch_only(&tube).await?;
             }
             let (id, body) = client.reserve(timeout).await?;
             output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+        }
+
+        Command::ReserveBatch { count, timeout, tube } => {
+            if let Some(tube) = tube {
+                client.watch_only(&tube).await?;
+            }
+            let jobs = client.reserve_batch(count, timeout).await?;
+            let jobs: Vec<_> = jobs
+                .into_iter()
+                .map(|(id, body)| serde_json::json!({ "id": id, "body": body }))
+                .collect();
+            output(&cli.format, &serde_json::json!({ "reserved": jobs.len(), "jobs": jobs }))?;
         }
 
         Command::Delete { id } => {
@@ -214,6 +319,26 @@ async fn main() -> anyhow::Result<()> {
             client.use_tube(&tube).await?;
             let count = client.kick(bound).await?;
             output(&cli.format, &serde_json::json!({ "kicked": count }))?;
+        }
+
+        Command::KickJob { id } => {
+            client.kick_job(id).await?;
+            output(&cli.format, &serde_json::json!({ "status": "kicked", "id": id }))?;
+        }
+
+        Command::ReserveJob { id } => {
+            let (id, body) = client.reserve_job(id).await?;
+            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+        }
+
+        Command::Drain => {
+            client.drain().await?;
+            output(&cli.format, &serde_json::json!({ "status": "draining" }))?;
+        }
+
+        Command::Undrain => {
+            client.undrain().await?;
+            output(&cli.format, &serde_json::json!({ "status": "not_draining" }))?;
         }
 
         Command::Peek { id } => {
@@ -251,6 +376,11 @@ async fn main() -> anyhow::Result<()> {
 
         Command::FlushTube { tube } => {
             let count = client.flush_tube(&tube).await?;
+            output(&cli.format, &serde_json::json!({ "flushed": count, "tube": tube }))?;
+        }
+
+        Command::FlushBuried { tube } => {
+            let count = client.flush_buried(&tube).await?;
             output(&cli.format, &serde_json::json!({ "flushed": count, "tube": tube }))?;
         }
 
