@@ -123,7 +123,21 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 | `[HOST]` positional | `$TUBER_ADDR` or `localhost:11300` | Server address |
 | `-i, --interval` | `1.5` | Poll interval (seconds) |
 
-Press `q` to quit.
+### Keys
+
+| Key | Action |
+|---|---|
+| `↑` `↓` / `k` `j` | Move the tube cursor |
+| `p` | Pause the selected tube — prompts for a duration |
+| `u` | Unpause the selected tube immediately |
+| `s` | Cycle sort: by name (default), then by size |
+| `e` | Show/hide idle tubes (empty and not paused) |
+| `q` | Quit |
+
+Pause durations are seconds by default, matching `tuber-cli pause --delay`.
+`m` and `h` suffixes scale from there, so `90`, `5m` and `2h` are all valid, and
+`0` unpauses. A paused tube carries a `PAUSED 12m` badge showing the time left,
+and stays visible even when empty and idle tubes are hidden.
 
 ### Layout
 

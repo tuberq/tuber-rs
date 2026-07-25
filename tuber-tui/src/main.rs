@@ -1,12 +1,13 @@
 mod app;
 mod ui;
 
-use app::App;
+use app::{format_secs, parse_duration, App, Mode};
 use clap::Parser;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
+use std::io;
 use std::io::stdout;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -28,6 +29,138 @@ struct Cli {
 enum PollMsg {
     Snapshot(Box<Snapshot>),
     Error(String),
+    Status { msg: String, error: bool },
+}
+
+/// What a keypress asked for. Commands are returned rather than issued inline
+/// so key handling stays synchronous and testable.
+enum Action {
+    None,
+    Quit,
+    Pause { tube: String, delay: u32 },
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) -> Action {
+    // The prompt swallows everything, including `q` — otherwise typing a
+    // duration could quit the app.
+    if let Mode::PausePrompt { tube, buf } = &app.mode {
+        let (tube, buf) = (tube.clone(), buf.clone());
+        return handle_prompt_key(app, key, tube, buf);
+    }
+
+    match key.code {
+        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_selection(-1);
+            Action::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_selection(1);
+            Action::None
+        }
+        KeyCode::Char('s') => {
+            app.cycle_sort();
+            Action::None
+        }
+        KeyCode::Char('e') => {
+            app.toggle_hide_empty();
+            Action::None
+        }
+        KeyCode::Char('p') => {
+            match app.selected.clone() {
+                Some(tube) => {
+                    app.mode = Mode::PausePrompt {
+                        tube,
+                        buf: String::new(),
+                    }
+                }
+                None => app.set_status("No tube selected".to_string(), true),
+            }
+            Action::None
+        }
+        KeyCode::Char('u') => {
+            let target = app.selected_tube().map(|t| (t.name.clone(), t.is_paused()));
+            match target {
+                Some((tube, true)) => Action::Pause { tube, delay: 0 },
+                Some((tube, false)) => {
+                    app.set_status(format!("{tube} is not paused"), false);
+                    Action::None
+                }
+                None => Action::None,
+            }
+        }
+        _ => Action::None,
+    }
+}
+
+fn handle_prompt_key(app: &mut App, key: KeyEvent, tube: String, buf: String) -> Action {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            Action::None
+        }
+        KeyCode::Enter => match parse_duration(&buf) {
+            Some(delay) => {
+                app.mode = Mode::Normal;
+                Action::Pause { tube, delay }
+            }
+            // No status message: it would linger after Esc, and the prompt
+            // already flags the bad input inline while it is being typed.
+            None => Action::None,
+        },
+        KeyCode::Backspace => {
+            if let Mode::PausePrompt { buf, .. } = &mut app.mode {
+                buf.pop();
+            }
+            Action::None
+        }
+        KeyCode::Char(c) => {
+            if let Mode::PausePrompt { buf, .. } = &mut app.mode {
+                if buf.len() < 8 {
+                    buf.push(c);
+                }
+            }
+            Action::None
+        }
+        _ => Action::None,
+    }
+}
+
+/// Issue a pause on its own short-lived connection. `pause-tube` is server-side
+/// tube state rather than connection state, so this is equivalent to issuing it
+/// on the poller's connection — and it leaves the poller's `use`/`watch` state
+/// untouched, which will matter once `kick` lands.
+fn spawn_pause(addr: String, tube: String, delay: u32, tx: mpsc::Sender<PollMsg>) {
+    tokio::spawn(async move {
+        let result: io::Result<Snapshot> = async {
+            let mut client = TuberClient::connect(&addr).await?;
+            client.pause_tube(&tube, delay).await?;
+            // Refresh on the same connection so the change shows immediately
+            // instead of waiting out the poll interval.
+            client.fetch_snapshot().await
+        }
+        .await;
+
+        let msg = match &result {
+            Ok(_) if delay == 0 => PollMsg::Status {
+                msg: format!("{tube} unpaused"),
+                error: false,
+            },
+            Ok(_) => PollMsg::Status {
+                msg: format!("{tube} paused for {}", format_secs(delay as u64)),
+                error: false,
+            },
+            Err(e) => PollMsg::Status {
+                msg: format!("{tube}: {e}"),
+                error: true,
+            },
+        };
+
+        if let Ok(snap) = result {
+            let _ = tx.send(PollMsg::Snapshot(Box::new(snap))).await;
+        }
+        let _ = tx.send(msg).await;
+    });
 }
 
 #[tokio::main]
@@ -42,6 +175,10 @@ async fn main() -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<PollMsg>(4);
     let addr = tuber_lib::resolve_addr(cli.addr.as_deref());
     let interval = Duration::from_secs_f64(cli.interval);
+
+    // Kept for command dispatch; the poller takes its own copies.
+    let cmd_addr = addr.clone();
+    let cmd_tx = tx.clone();
 
     // Poller task
     tokio::spawn(async move {
@@ -81,13 +218,20 @@ async fn main() -> anyhow::Result<()> {
                 match msg {
                     PollMsg::Snapshot(snap) => app.update(*snap),
                     PollMsg::Error(e) => app.set_error(e),
+                    PollMsg::Status { msg, error } => app.set_status(msg, error),
                 }
                 terminal.draw(|f| ui::render(f, &app))?;
             }
             Some(Ok(event)) = event_stream.next() => {
                 if let Event::Key(key) = event {
-                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                        break;
+                    if key.kind == KeyEventKind::Press {
+                        match handle_key(&mut app, key) {
+                            Action::Quit => break,
+                            Action::Pause { tube, delay } => {
+                                spawn_pause(cmd_addr.clone(), tube, delay, cmd_tx.clone());
+                            }
+                            Action::None => {}
+                        }
                     }
                 }
                 terminal.draw(|f| ui::render(f, &app))?;
