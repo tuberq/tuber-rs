@@ -1,3 +1,6 @@
 /target
 memory
 .DS_Store
+
+# Screen recordings — the README ships the GIF, the source stays local
+*.mp4

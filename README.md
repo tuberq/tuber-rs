@@ -85,7 +85,7 @@ session) to reserve and finish a job together; see `skill/SKILL.md`.
 
 A real-time terminal dashboard for monitoring tuber queues.
 
-![tuber-tui screenshot](screenshots/tui.png)
+![tuber-tui](screenshots/tuber-tui.gif)
 
 ### Features
 
@@ -97,6 +97,16 @@ A real-time terminal dashboard for monitoring tuber queues.
 - Queue growth indicators
 - Buried job highlighting
 - Auto-reconnect on connection loss
+
+The detail pane follows the cursor. Over a tube it breaks down that tube's jobs,
+runtimes, oldest ages and clients:
+
+![tuber-tui with a tube selected](screenshots/tuber-tui-tube.png)
+
+Move onto the `server` footer row and the pane turns over to server-wide totals —
+memory, disk, WAL and TOAST headroom, command counts, host:
+
+![tuber-tui with the server row selected](screenshots/tuber-tui-server.png)
 
 ### Install
 
