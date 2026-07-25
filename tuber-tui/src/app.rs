@@ -151,21 +151,20 @@ impl App {
     /// cursor movement, so the two cannot disagree — callers should compute
     /// this once per frame and pass the slice down.
     pub fn visible_tubes(&self) -> Vec<&TubeStats> {
-        self.filtered_tubes(|t| !self.hide_empty || !is_empty(t) || pinned(t))
-    }
-
-    /// Tubes worth a row in the timing table: they have timing data *and* are
-    /// doing something. `processing_time_ewma` alone is a lifetime property
-    /// that never decays, so it would list every tube the server has ever run.
-    ///
-    /// Deliberately *not* a subset of `visible_tubes`: a tube that drained a
-    /// moment ago is hidden from the chart but its percentiles are still the
-    /// most interesting thing on screen.
-    pub fn timing_tubes(&self) -> Vec<&TubeStats> {
-        self.filtered_tubes(|t| t.processing_time_ewma > 0.0 && self.tube_active(t))
+        self.filtered_tubes(|t| {
+            !self.hide_empty || !is_empty(t) || pinned(t) || self.tube_active(t)
+        })
     }
 
     /// Holding jobs now, or having moved any since the last poll.
+    ///
+    /// This pins a tube that drained a moment ago onto the screen for a poll or
+    /// two. It used to select the timing table's rows, which was deliberately
+    /// *not* a subset of the chart's — a just-drained tube was absent from the
+    /// chart while its percentiles were still the most interesting thing on
+    /// screen. Now that the timing detail is a pane for the *selected* tube,
+    /// unreachable means uninspectable, so the same predicate has to keep the
+    /// tube selectable instead.
     fn tube_active(&self, tube: &TubeStats) -> bool {
         if tube.current_total() > 0 {
             return true;
@@ -259,8 +258,7 @@ impl App {
 /// tube that drained a moment ago counts as empty. `current_total` covers
 /// buried, so an empty tube cannot be hiding failures.
 ///
-/// Distinct from `tube_active`, which is about motion and decides the timing
-/// table's rows.
+/// Distinct from `tube_active`, which is about motion rather than contents.
 fn is_empty(tube: &TubeStats) -> bool {
     tube.current_total() == 0
 }

@@ -12,10 +12,12 @@ use ratatui::Frame;
 const CHART_OVERHEAD: usize = 2;
 /// Tube rows the chart keeps even when the timing table wants more space.
 const CHART_MIN_ROWS: usize = 4;
-/// Stats panel rows that are always present: top border, the two summary
-/// lines, and two spare — the spares carry the optional "+N more" / "resize
-/// taller" note and the blank tail the original layout allowed for.
-const STATS_FIXED: usize = 5;
+/// Stats panel rows that are always present: top border and the two
+/// server-wide summary lines. Everything below them is the selected tube's
+/// detail, which is budgeted separately.
+const STATS_FIXED: usize = 3;
+/// Width of the dim label starting each detail line.
+const DETAIL_LABEL: usize = 9;
 /// Most of the space below the top bar the chart may claim before the timing
 /// table gets a look in.
 const CHART_MAX_SHARE: (usize, usize) = (2, 3);
@@ -57,6 +59,10 @@ const STATES: [(&str, Color); 5] = [
     ("buried", Color::Red),
 ];
 
+/// The same states spelled out, for the detail pane's running text. The chart's
+/// headers are abbreviated to fit a six-column field; a sentence is not.
+const STATE_NAMES: [&str; 5] = ["ready", "urgent", "reserved", "delayed", "buried"];
+
 /// A tube's counts, indexed to match [`STATES`].
 ///
 /// Ready is net of urgent: `current-jobs-urgent` is a subset of
@@ -72,14 +78,19 @@ fn state_counts(tube: &TubeStats) -> [u64; 5] {
     ]
 }
 
-/// Split the space below the top bar between the tube chart and the timing
-/// table. The chart is the primary widget and is served first; the timing
-/// table takes what is left over. Returns `(bottom_height, timing_rows)`.
+/// Split the space below the top bar between the tube chart and the Stats
+/// panel. The chart is the primary widget and is served first; the panel takes
+/// what is left over. Returns `(bottom_height, detail_rows)`.
 ///
-/// This used to be the other way round — the timing table asked for one row
-/// per tube as a fixed `Length`, so on a short terminal it consumed the screen
-/// and squeezed the chart to its minimum.
-fn split_bottom(avail: usize, visible_tubes: usize, timing_tubes: usize) -> (usize, usize) {
+/// This used to be the other way round — the panel asked for one row per tube
+/// as a fixed `Length`, so on a short terminal it consumed the screen and
+/// squeezed the chart to its minimum.
+///
+/// `detail_lines` is how many lines the selected tube's detail wants. Unlike the
+/// timing table this replaced, a partial pane is still worth showing: the lines
+/// are ordered so that the ones that survive a squeeze are the ones you would
+/// have read first.
+fn split_bottom(avail: usize, visible_tubes: usize, detail_lines: usize) -> (usize, usize) {
     let chart_floor = CHART_MIN_ROWS + CHART_OVERHEAD;
 
     // The chart is served first, but it cannot claim the whole screen just
@@ -95,18 +106,13 @@ fn split_bottom(avail: usize, visible_tubes: usize, timing_tubes: usize) -> (usi
         return (ceiling, 0);
     }
 
-    // Budget the header row up front, so `rows` is decided once rather than
-    // computed against one limit and then re-clamped against another.
+    // Budget the tube's heading row up front, so `rows` is decided once rather
+    // than computed against one limit and then re-clamped against another.
     let budget = avail
         .saturating_sub(chart_want)
         .min(ceiling)
         .saturating_sub(STATS_FIXED + 1);
-    let mut rows = timing_tubes.min(budget);
-    // One or two rows plus a "+N more" marker tells you nothing; spend the
-    // space on the chart instead.
-    if rows < 3 && rows < timing_tubes {
-        rows = 0;
-    }
+    let rows = detail_lines.min(budget);
     (STATS_FIXED + usize::from(rows > 0) + rows, rows)
 }
 
@@ -126,16 +132,22 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or(false);
     let top_height = if has_storage_line { 5 } else { 4 };
 
-    // Both lists are computed once per frame and passed down. Recomputing them
-    // in each panel would re-filter and re-sort, and would make the two panels
-    // agree only by coincidence rather than by construction.
+    // Computed once per frame and passed down. Recomputing it in each panel
+    // would re-filter and re-sort, and would make the chart and the detail pane
+    // agree on what is selected only by coincidence rather than by construction.
     let visible = app.visible_tubes();
-    let timing = app.timing_tubes();
 
-    let (bottom_height, timing_rows) = split_bottom(
+    // The pane's content decides its height, so it is built before the layout
+    // rather than after — the lines are the measurement.
+    let detail = app
+        .selected_tube()
+        .map(|tube| tube_detail_lines(tube, app))
+        .unwrap_or_default();
+
+    let (bottom_height, detail_rows) = split_bottom(
         area.height.saturating_sub(top_height) as usize,
         visible.len(),
-        timing.len(),
+        detail.len(),
     );
 
     let chunks = Layout::vertical([
@@ -147,7 +159,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_top_bar(frame, app, chunks[0]);
     render_tube_chart(frame, app, chunks[1], &visible);
-    render_bottom_panel(frame, app, chunks[2], &timing, timing_rows);
+    render_bottom_panel(frame, app, chunks[2], detail, detail_rows);
     render_prompt_overlay(frame, app, area);
 }
 
@@ -784,8 +796,8 @@ fn render_bottom_panel(
     frame: &mut Frame,
     app: &App,
     area: Rect,
-    all_timing: &[&TubeStats],
-    timing_rows: usize,
+    detail: Vec<DetailLine>,
+    detail_rows: usize,
 ) {
     let block = Block::default().borders(Borders::TOP).title(" Stats ");
 
@@ -811,22 +823,6 @@ fn render_bottom_panel(
         (b + t.current_jobs_buried, p + usize::from(t.is_paused()))
     });
 
-    // Trimmed to the row budget the layout allowed us, giving up a row to the
-    // "+N more" marker when we cannot show everything.
-    let truncated = all_timing.len() > timing_rows;
-    let shown = if truncated {
-        timing_rows.saturating_sub(1)
-    } else {
-        all_timing.len()
-    };
-    let timing_tubes = &all_timing[..shown];
-    let max_name_len = timing_tubes
-        .iter()
-        .map(|t| t.name.len())
-        .max()
-        .unwrap_or(0)
-        .min(20);
-
     let buried_style = if total_buried > 0 {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
@@ -850,95 +846,251 @@ fn render_bottom_panel(
 
     let mut text = vec![line1, Line::from(line2_spans)];
 
-    // The layout dropped the timing table entirely to keep the chart usable.
-    // Say so, rather than letting it look as though no tube has timing data.
-    if timing_rows == 0 && !all_timing.is_empty() {
-        text.push(Line::from(Span::styled(
-            format!(
-                " {} tube{} with recent activity have timing data \u{2014} resize taller to show",
-                all_timing.len(),
-                plural(all_timing.len())
-            ),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    if !timing_tubes.is_empty() {
-        let thresh_ms = (snap.server.processing_time_fast_threshold * 1000.0) as u64;
-        let header = Line::from(vec![
-            Span::styled(
-                format!(" {:>width$} ", "ewma", width = max_name_len),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                format!("{:>6} | {:>6}", format!("<{}ms", thresh_ms), format!(">{}ms", thresh_ms)),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                format!(" | {:>6} | {:>6} | {:>6}", "p50", "p95", "p99"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(format!(" | {:>6}", "tiq"), Style::default().fg(Color::DarkGray)),
-        ]);
-        text.push(header);
-
-        const DASH: &str = "     \u{2014}"; // right-aligned em-dash, 6 display columns
-        for tube in timing_tubes {
-            let selected = app.selected.as_deref() == Some(tube.name.as_str());
-            let name_style = if selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
+    // The selected tube's detail, trimmed to the rows the layout allowed. The
+    // lines are already in reading order, so a truncated pane keeps its most
+    // useful half rather than an arbitrary one.
+    if detail_rows > 0 {
+        if let Some(name) = app.selected.as_deref() {
+            let rule = area.width as usize;
+            let heading = format!(" {name} ");
+            // A dropped line is worth saying so — an absent `oldest` row reads
+            // as "no old jobs" rather than "no room" — but it rides the
+            // heading's rule rather than taking a row of its own. Spending one
+            // of two available lines on a note about the other four would be a
+            // poor trade, and a row budgeted for the note is a row the pane
+            // cannot use when nothing is dropped.
+            let note = match detail.len() - detail_rows {
+                0 => String::new(),
+                n => format!(" +{n} more (resize taller) "),
             };
-            let mut spans = vec![
+            let rule = rule
+                .saturating_sub(heading.chars().count())
+                .saturating_sub(note.chars().count());
+            text.push(Line::from(vec![
                 Span::styled(
-                    format!(" {:>width$} ", truncate_name(&tube.name, max_name_len), width = max_name_len),
-                    name_style,
+                    heading,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-            ];
-
-            // Bimodal EWMA
-            let fast = if tube.processing_time_samples_fast > 0 {
-                format_duration(tube.processing_time_ewma_fast)
-            } else {
-                DASH.to_string()
-            };
-            let slow = if tube.processing_time_samples_slow > 0 {
-                format_duration(tube.processing_time_ewma_slow)
-            } else {
-                DASH.to_string()
-            };
-            spans.push(Span::raw(format!("{} | {}", fast, slow)));
-
-            // Percentiles
-            if tube.processing_time_p50 > 0.0 {
-                spans.push(Span::raw(format!(
-                    " | {} | {} | {}",
-                    format_duration(tube.processing_time_p50),
-                    format_duration(tube.processing_time_p95),
-                    format_duration(tube.processing_time_p99),
-                )));
-            }
-
-            // Time in queue
-            if tube.queue_time_ewma > 0.0 {
-                spans.push(Span::raw(format!(" | {}", format_duration(tube.queue_time_ewma))));
-            }
-
-            text.push(Line::from(spans));
+                Span::styled("\u{2500}".repeat(rule), Style::default().fg(Color::DarkGray)),
+                Span::styled(note, Style::default().fg(Color::DarkGray)),
+            ]));
         }
-
-        if truncated {
-            let more = all_timing.len() - timing_tubes.len();
-            text.push(Line::from(Span::styled(
-                format!(" +{more} more (resize to see)"),
-                Style::default().fg(Color::DarkGray),
-            )));
+        for line in detail.into_iter().take(detail_rows) {
+            text.push(line.into_line());
         }
     }
 
     let p = Paragraph::new(text).block(block);
     frame.render_widget(p, area);
+}
+
+/// One row of the detail pane: a dim label and its content.
+///
+/// Kept as a struct rather than a finished `Line` so the pane can be built and
+/// counted before the layout is decided, then rendered afterwards — the height
+/// depends on the content, so the content has to come first.
+pub struct DetailLine {
+    label: &'static str,
+    spans: Vec<Span<'static>>,
+}
+
+impl DetailLine {
+    fn into_line(self) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            format!(" {:<width$}", self.label, width = DETAIL_LABEL),
+            Style::default().fg(Color::DarkGray),
+        )];
+        spans.extend(self.spans);
+        Line::from(spans)
+    }
+}
+
+/// Join `parts` with a dim middot, dropping any that are empty.
+fn joined(parts: Vec<Vec<Span<'static>>>) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for part in parts.into_iter().filter(|p| !p.is_empty()) {
+        if !out.is_empty() {
+            out.push(Span::styled(" \u{00b7} ", Style::default().fg(Color::DarkGray)));
+        }
+        out.extend(part);
+    }
+    out
+}
+
+/// `value label` with the value plain and the unit dimmed.
+fn pair(value: String, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::raw(value),
+        Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray)),
+    ]
+}
+
+/// Everything worth knowing about one tube, in reading order — the lines that
+/// survive a squeeze are the ones you would have read first.
+///
+/// This replaced a table of every tube's timing. A table could compare tubes but
+/// had room for six columns and nothing else, which left 19 of `TubeStats`'
+/// fields — the oldest job ages, the bury rate, the min/max processing times,
+/// the watcher counts — parsed on every poll and never displayed.
+fn tube_detail_lines(tube: &TubeStats, app: &App) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+    let counts = state_counts(tube);
+
+    // Jobs held, by state, in the same colours and order as the chart's columns.
+    let jobs = joined(
+        (0..STATES.len())
+            .filter(|&i| counts[i] > 0)
+            .map(|i| {
+                vec![
+                    Span::styled(format_number(counts[i]), Style::default().fg(STATES[i].1)),
+                    Span::styled(
+                        format!(" {}", STATE_NAMES[i]),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]
+            })
+            .collect(),
+    );
+    lines.push(DetailLine {
+        label: "jobs",
+        spans: if jobs.is_empty() {
+            vec![Span::styled("empty", Style::default().fg(Color::DarkGray))]
+        } else {
+            jobs
+        },
+    });
+
+    // Processing time. The bimodal pair is tuber's distinctive signal, so it
+    // leads; the threshold splitting them is the server's, not the tube's.
+    let thresh = app
+        .current
+        .as_ref()
+        .map(|s| s.server.processing_time_fast_threshold)
+        .unwrap_or(0.1);
+    let mut timing: Vec<Vec<Span<'static>>> = Vec::new();
+    if tube.processing_time_samples_fast > 0 {
+        timing.push(pair(
+            tight(tube.processing_time_ewma_fast),
+            &format!("under {}", tight(thresh)),
+        ));
+    }
+    if tube.processing_time_samples_slow > 0 {
+        timing.push(pair(
+            tight(tube.processing_time_ewma_slow),
+            &format!("over {}", tight(thresh)),
+        ));
+    }
+    if tube.processing_time_p50 > 0.0 {
+        timing.push(pair(tight(tube.processing_time_p50), "p50"));
+        timing.push(pair(tight(tube.processing_time_p95), "p95"));
+        timing.push(pair(tight(tube.processing_time_p99), "p99"));
+    }
+    if !timing.is_empty() {
+        lines.push(DetailLine { label: "runtime", spans: joined(timing) });
+    }
+
+    // How long work has been sitting. An age of zero means nothing in that
+    // state, which the jobs line already said, so those are dropped.
+    let ages = joined(
+        [
+            ("ready", tube.oldest_ready_age),
+            ("delayed", tube.oldest_delayed_age),
+            ("buried", tube.oldest_buried_age),
+        ]
+        .into_iter()
+        .filter(|(_, age)| *age > 0)
+        .map(|(label, age)| pair(format_age(age), label))
+        .collect(),
+    );
+    if !ages.is_empty() {
+        lines.push(DetailLine { label: "oldest", spans: ages });
+    }
+
+    // Waiting time and the spread behind the averages above.
+    let mut queue: Vec<Vec<Span<'static>>> = Vec::new();
+    if tube.queue_time_ewma > 0.0 {
+        queue.push(pair(tight(tube.queue_time_ewma), "in queue"));
+    }
+    if tube.processing_time_samples > 0 {
+        queue.push(pair(
+            format!(
+                "{}\u{2013}{}",
+                tight(tube.processing_time_min),
+                tight(tube.processing_time_max)
+            ),
+            &format!("over {} runs", format_number(tube.processing_time_samples)),
+        ));
+    }
+    if tube.bury_rate > 0.0 {
+        queue.push(vec![Span::styled(
+            format!("{:.2}/s buried", tube.bury_rate),
+            Style::default().fg(Color::Red),
+        )]);
+    }
+    if !queue.is_empty() {
+        lines.push(DetailLine { label: "waiting", spans: joined(queue) });
+    }
+
+    // Who is attached, and what they have done.
+    let clients = joined(vec![
+        pair(tube.current_using.to_string(), "using"),
+        pair(tube.current_watching.to_string(), "watching"),
+        pair(tube.current_waiting.to_string(), "waiting"),
+        pair(format_number(tube.total_reserves), "reserves"),
+        if tube.total_timeouts > 0 {
+            vec![Span::styled(
+                format!("{} timeouts", format_number(tube.total_timeouts)),
+                Style::default().fg(Color::Yellow),
+            )]
+        } else {
+            Vec::new()
+        },
+    ]);
+    lines.push(DetailLine { label: "clients", spans: clients });
+
+    if tube.is_paused() {
+        lines.push(DetailLine {
+            label: "paused",
+            spans: joined(vec![
+                pair(format_secs(tube.pause_time_left), "left"),
+                pair(format_secs(tube.pause), "requested"),
+                pair(tube.cmd_pause_tube.to_string(), "pauses total"),
+            ]),
+        });
+    }
+
+    lines
+}
+
+/// Seconds as an age: `45s`, `4m12s`, `2h5m`, `3d4h`.
+///
+/// Distinct from `format_secs`, which rounds minutes *up* so a fresh pause reads
+/// back the duration that was asked for. Rounding an age up would overstate it,
+/// and an age wants the days that a pause countdown never reaches.
+fn format_age(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    match secs {
+        s if s < MIN => format!("{s}s"),
+        s if s < HOUR => trim_zero(s / MIN, s % MIN, 'm', 's'),
+        s if s < DAY => trim_zero(s / HOUR, (s % HOUR) / MIN, 'h', 'm'),
+        s => trim_zero(s / DAY, (s % DAY) / HOUR, 'd', 'h'),
+    }
+}
+
+/// `4m12s`, or just `4m` when the smaller unit is zero.
+fn trim_zero(big: u64, small: u64, big_unit: char, small_unit: char) -> String {
+    if small == 0 {
+        format!("{big}{big_unit}")
+    } else {
+        format!("{big}{big_unit}{small}{small_unit}")
+    }
+}
+
+/// `format_duration` without its right-aligning pad, for running text.
+fn tight(seconds: f64) -> String {
+    format_duration(seconds).trim().to_string()
 }
 
 fn format_uptime(seconds: u64) -> String {
@@ -1076,28 +1228,38 @@ mod tests {
     fn tall_terminal_fits_everything() {
         // 50-row terminal, 5-row top bar: 19 tubes, 6 with timing data.
         let (bottom, rows) = split_bottom(45, 19, 6);
-        assert_eq!(rows, 6, "all timing tubes shown");
+        assert_eq!(rows, 6, "all detail lines shown");
         assert!(chart_rows(45, bottom) >= 19, "all tubes shown without scrolling");
     }
 
     #[test]
     fn short_terminal_keeps_the_chart_usable() {
         // 80x24 with a 5-row top bar. This is the case the old layout broke:
-        // the timing table took 19 rows and left the chart at its floor.
+        // the panel took 19 rows and left the chart at its floor.
         let (bottom, rows) = split_bottom(19, 19, 6);
         assert!(
             chart_rows(19, bottom) >= 10,
             "chart got {} rows, expected it to keep the majority",
             chart_rows(19, bottom)
         );
-        assert_eq!(rows, 0, "a 1-2 row timing table is not worth the space");
+        // A partial pane is still worth showing, unlike the timing table this
+        // replaced: its lines are in reading order, so the ones that survive are
+        // the ones that matter. The table needed three rows to say anything.
+        assert!(rows > 0 && rows < 6, "expected a partial pane, got {rows}");
     }
 
     #[test]
     fn medium_terminal_splits_and_truncates() {
         let (bottom, rows) = split_bottom(29, 19, 6);
-        assert!(rows > 0 && rows < 6, "partial timing table, got {rows}");
+        assert!(rows > 0 && rows <= 6, "partial pane, got {rows}");
         assert!(chart_rows(29, bottom) >= 14);
+    }
+
+    #[test]
+    fn a_tall_terminal_shows_the_whole_pane() {
+        // Six detail lines is the most a tube ever produces.
+        let (_, rows) = split_bottom(45, 8, 6);
+        assert_eq!(rows, 6, "all detail lines shown");
     }
 
     #[test]
@@ -1118,28 +1280,24 @@ mod tests {
     }
 
     #[test]
-    fn a_claimed_row_always_renders_a_tube() {
-        // render_bottom_panel gives a row up to the "+N more" marker when it
-        // cannot show everything, so returning rows=1 with more to show would
-        // reserve panel height and then render no timing rows at all — and no
-        // note either, since that is gated on rows == 0.
+    fn a_claimed_row_is_always_backed_by_height() {
+        // The panel renders a heading row plus `rows` detail lines, so a height
+        // that does not cover both would clip the pane it just reserved space
+        // for. Swept rather than spot-checked: the budget arithmetic subtracts
+        // in two places and an off-by-one hides easily.
         for avail in 0..200 {
             for visible in 0..60 {
-                for timing in 0..60 {
-                    let (height, rows) = split_bottom(avail, visible, timing);
+                for detail in 0..8 {
+                    let (height, rows) = split_bottom(avail, visible, detail);
+                    assert!(height <= avail, "avail={avail} -> height {height}");
+                    assert!(rows <= detail, "invented {rows} lines from {detail}");
                     if rows == 0 {
                         continue;
                     }
-                    let truncated = timing > rows;
-                    let shown = if truncated { rows - 1 } else { timing };
-                    assert!(
-                        shown > 0,
-                        "avail={avail} visible={visible} timing={timing} -> rows={rows} \
-                         reserves height {height} but renders no timing rows"
-                    );
                     assert!(
                         height >= STATS_FIXED + 1 + rows,
-                        "avail={avail} timing={timing} -> height {height} too small for {rows} rows"
+                        "avail={avail} detail={detail} -> height {height} too small \
+                         for a heading plus {rows} lines"
                     );
                 }
             }
@@ -1270,7 +1428,154 @@ mod tests {
         assert_eq!(truncate_name("\u{4f5c}\u{696d}\u{5217}", 2), "\u{4f5c}\u{696d}");
     }
 
-    /// A state no visible tube is using spends no width.
+    /// A tube with every field the protocol offers, for the detail pane.
+    fn rich_tube() -> TubeStats {
+        TubeStats::from_yaml(
+            "name: covers\ncurrent-jobs-ready: 1600000\ncurrent-jobs-urgent: 0\n\
+             current-jobs-reserved: 0\ncurrent-jobs-delayed: 124\n\
+             current-jobs-buried: 23\noldest-ready-age: 252\n\
+             oldest-delayed-age: 63\noldest-buried-age: 183600\n\
+             bury-rate: 0.02\nprocessing-time-ewma: 0.079\n\
+             processing-time-ewma-fast: 0.079\nprocessing-time-samples-fast: 900000\n\
+             processing-time-ewma-slow: 0.862\nprocessing-time-samples-slow: 300000\n\
+             processing-time-p50: 0.100\nprocessing-time-p95: 1.3\nprocessing-time-p99: 1.6\n\
+             processing-time-min: 0.008\nprocessing-time-max: 4.2\n\
+             processing-time-samples: 1200000\nqueue-time-ewma: 2502.0\n\
+             current-using: 3\ncurrent-watching: 5\ncurrent-waiting: 0\n\
+             total-reserves: 1200000\ntotal-timeouts: 4\n",
+        )
+    }
+
+    fn app_with_selection(tubes: Vec<TubeStats>, selected: &str) -> App {
+        let mut app = sample_app(tubes);
+        app.selected = Some(selected.to_string());
+        app
+    }
+
+    /// The content of a detail-pane line, found by its label. `None` when the
+    /// pane has no such line. Matches on the label's own column rather than
+    /// anywhere in the text: `clients` carries a "0 waiting" count, which a
+    /// substring search would mistake for the `waiting` line.
+    fn detail_line(lines: &[String], label: &str) -> Option<String> {
+        let prefix = format!(" {:<width$}", label, width = DETAIL_LABEL);
+        lines
+            .iter()
+            .find(|l| l.starts_with(&prefix))
+            .map(|l| l[prefix.len()..].to_string())
+    }
+
+    /// Render the whole frame and give back its lines as plain text.
+    fn draw_frame(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_pane_shows_the_selected_tube_in_full() {
+        let app = app_with_selection(vec![rich_tube()], "covers");
+        let lines = draw_frame(&app, 130, 24);
+        let pane = lines.join("\n");
+
+        for label in ["jobs", "runtime", "oldest", "waiting", "clients"] {
+            assert!(
+                detail_line(&lines, label).is_some(),
+                "pane has no {label} line:\n{pane}"
+            );
+        }
+        // Fields that had nowhere to go before the pane existed.
+        for value in ["2d3h", "8ms\u{2013}4.2s", "0.02/s", "5 watching", "4 timeouts"] {
+            assert!(pane.contains(value), "pane is missing {value}:\n{pane}");
+        }
+        // The bimodal pair reads against the server's threshold, not a guess.
+        assert!(pane.contains("79ms under 100ms"), "no fast ewma:\n{pane}");
+        assert!(pane.contains("862ms over 100ms"), "no slow ewma:\n{pane}");
+        // The tube's name heads the pane.
+        assert!(lines.iter().any(|l| l.starts_with(" covers \u{2500}")), "no heading:\n{pane}");
+    }
+
+    /// beanstalkd reports none of the percentiles, ages or rates that tuber
+    /// does, so most of the pane has no data to show. Those lines must be
+    /// dropped rather than rendered as a row of dashes.
+    #[test]
+    fn the_pane_drops_lines_it_has_no_data_for() {
+        let bare = TubeStats::from_yaml(
+            "name: q\ncurrent-jobs-ready: 2\ncurrent-jobs-urgent: 2\ncurrent-using: 1\n",
+        );
+        let app = app_with_selection(vec![bare], "q");
+        let lines = draw_frame(&app, 130, 24);
+        let pane = lines.join("\n");
+
+        assert!(detail_line(&lines, "jobs").is_some(), "jobs is unconditional:\n{pane}");
+        assert!(detail_line(&lines, "clients").is_some(), "clients is unconditional:\n{pane}");
+        for absent in ["runtime", "oldest", "waiting"] {
+            assert!(
+                detail_line(&lines, absent).is_none(),
+                "{absent} has no data but was rendered:\n{pane}"
+            );
+        }
+        // Urgent is a subset of ready, so a wholly urgent tube shows no plain
+        // ready count — the same netting the chart columns do.
+        assert_eq!(detail_line(&lines, "jobs").unwrap(), "2 urgent");
+    }
+
+    #[test]
+    fn nothing_in_the_frame_overflows_its_width() {
+        let mut tubes = sample_tubes();
+        tubes.push(rich_tube());
+        let app = app_with_selection(tubes, "covers");
+        for width in 60..=140u16 {
+            for line in draw_frame(&app, width, 30) {
+                assert!(
+                    line.chars().count() <= width as usize,
+                    "width {width} overflowed: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// A squeezed pane keeps its first lines and says how many it dropped, in
+    /// the heading rather than in a row of its own.
+    #[test]
+    fn a_squeezed_pane_reports_what_it_dropped() {
+        let app = app_with_selection(vec![rich_tube()], "covers");
+        let short_lines = draw_frame(&app, 80, 16);
+        let short = short_lines.join("\n");
+        assert!(short.contains("more (resize taller)"), "no note:\n{short}");
+        assert!(detail_line(&short_lines, "jobs").is_some(), "dropped the first line");
+        assert!(detail_line(&short_lines, "clients").is_none(), "kept the last line");
+
+        // With room, no note and every line present.
+        let tall_lines = draw_frame(&app, 80, 24);
+        let tall = tall_lines.join("\n");
+        assert!(!tall.contains("resize taller"), "note shown with room:\n{tall}");
+        assert!(detail_line(&tall_lines, "clients").is_some(), "last line missing:\n{tall}");
+    }
+
+    #[test]
+    fn ages_read_as_ages() {
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(45), "45s");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(252), "4m12s");
+        assert_eq!(format_age(3600), "1h");
+        assert_eq!(format_age(7500), "2h5m");
+        assert_eq!(format_age(183_600), "2d3h");
+        assert_eq!(format_age(172_800), "2d");
+        // Unlike format_secs, an age is not rounded up: 4m12s is not "5m".
+        assert_eq!(format_secs(252), "5m");
+    }
+
+    /// A state no visible tube is using spends no width.    /// A state no visible tube is using spends no width.
     #[test]
     fn an_unused_state_gets_no_column() {
         let quiet: Vec<TubeStats> = sample_tubes()
@@ -1419,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn no_timing_tubes_means_no_rows() {
+    fn no_selected_tube_means_no_pane() {
         let (bottom, rows) = split_bottom(45, 8, 0);
         assert_eq!(rows, 0);
         assert_eq!(bottom, STATS_FIXED);
