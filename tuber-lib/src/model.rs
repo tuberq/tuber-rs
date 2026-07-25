@@ -125,7 +125,15 @@ pub struct TubeStats {
     pub oldest_ready_age: u64,
     pub oldest_delayed_age: u64,
     pub oldest_buried_age: u64,
+    pub cmd_pause_tube: u64,
+    pub pause: u64,
+    pub pause_time_left: u64,
+    pub bury_rate: f64,
     pub processing_time_ewma: f64,
+    pub processing_time_min: f64,
+    pub processing_time_max: f64,
+    pub processing_time_samples: u64,
+    pub processing_time_fast_threshold: f64,
     pub processing_time_ewma_fast: f64,
     pub processing_time_samples_fast: u64,
     pub processing_time_ewma_slow: f64,
@@ -134,12 +142,20 @@ pub struct TubeStats {
     pub processing_time_p95: f64,
     pub processing_time_p99: f64,
     pub queue_time_ewma: f64,
+    pub queue_time_min: f64,
+    pub queue_time_max: f64,
+    pub queue_time_samples: u64,
     pub cmd_delete: u64,
 }
 
 impl TubeStats {
     pub fn current_total(&self) -> u64 {
         self.current_jobs_ready + self.current_jobs_reserved + self.current_jobs_delayed + self.current_jobs_buried
+    }
+
+    /// True when the tube is paused and the pause has not yet elapsed.
+    pub fn is_paused(&self) -> bool {
+        self.pause_time_left > 0
     }
 
     pub fn from_yaml(yaml: &str) -> Self {
@@ -162,7 +178,15 @@ impl TubeStats {
             oldest_ready_age: get_u64(&m, "oldest-ready-age"),
             oldest_delayed_age: get_u64(&m, "oldest-delayed-age"),
             oldest_buried_age: get_u64(&m, "oldest-buried-age"),
+            cmd_pause_tube: get_u64(&m, "cmd-pause-tube"),
+            pause: get_u64(&m, "pause"),
+            pause_time_left: get_u64(&m, "pause-time-left"),
+            bury_rate: get_f64(&m, "bury-rate"),
             processing_time_ewma: get_f64(&m, "processing-time-ewma"),
+            processing_time_min: get_f64(&m, "processing-time-min"),
+            processing_time_max: get_f64(&m, "processing-time-max"),
+            processing_time_samples: get_u64(&m, "processing-time-samples"),
+            processing_time_fast_threshold: get_f64(&m, "processing-time-fast-threshold"),
             processing_time_ewma_fast: get_f64(&m, "processing-time-ewma-fast"),
             processing_time_samples_fast: get_u64(&m, "processing-time-samples-fast"),
             processing_time_ewma_slow: get_f64(&m, "processing-time-ewma-slow"),
@@ -171,6 +195,9 @@ impl TubeStats {
             processing_time_p95: get_f64(&m, "processing-time-p95"),
             processing_time_p99: get_f64(&m, "processing-time-p99"),
             queue_time_ewma: get_f64(&m, "queue-time-ewma"),
+            queue_time_min: get_f64(&m, "queue-time-min"),
+            queue_time_max: get_f64(&m, "queue-time-max"),
+            queue_time_samples: get_u64(&m, "queue-time-samples"),
             cmd_delete: get_u64(&m, "cmd-delete"),
         }
     }
@@ -255,6 +282,94 @@ impl GroupStats {
             buried: get_u64(&m, "buried"),
             waiting_jobs: get_u64(&m, "waiting-jobs"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `stats-tube` output for a paused tube.
+    const PAUSED_TUBE: &str = "---
+name: \"active_job_goodreads\"
+current-jobs-urgent: 0
+current-jobs-ready: 2543
+current-jobs-reserved: 0
+current-jobs-delayed: 0
+current-jobs-buried: 0
+total-jobs: 30577
+current-using: 0
+current-watching: 18
+current-waiting: 0
+oldest-ready-id: 278276622
+oldest-ready-age: 84940
+oldest-delayed-age: 0
+oldest-buried-age: 0
+cmd-delete: 28034
+cmd-pause-tube: 1
+pause: 3600
+pause-time-left: 3316
+total-reserves: 28089
+total-timeouts: 54
+total-buries: 0
+bury-rate: 0.000000
+processing-time-ewma: 0.002992
+processing-time-min: 0.000832
+processing-time-max: 77.396080
+processing-time-samples: 28034
+processing-time-fast-threshold: 0.100000
+processing-time-ewma-fast: 0.002625
+processing-time-samples-fast: 27867
+processing-time-ewma-slow: 6.209128
+processing-time-samples-slow: 167
+processing-time-p50: 0.006194
+processing-time-p95: 0.223164
+processing-time-p99: 0.469719
+queue-time-ewma: 9621.553614
+queue-time-min: 0.000008
+queue-time-max: 52790.799139
+queue-time-samples: 28089
+";
+
+    #[test]
+    fn parses_pause_fields() {
+        let t = TubeStats::from_yaml(PAUSED_TUBE);
+        assert_eq!(t.name, "active_job_goodreads");
+        assert_eq!(t.cmd_pause_tube, 1);
+        assert_eq!(t.pause, 3600);
+        assert_eq!(t.pause_time_left, 3316);
+        assert!(t.is_paused());
+    }
+
+    #[test]
+    fn not_paused_when_no_time_left() {
+        // A tube that was paused earlier but has since resumed still reports
+        // cmd-pause-tube and pause, but pause-time-left drops to 0.
+        let yaml = "---\nname: \"x\"\ncmd-pause-tube: 4\npause: 60\npause-time-left: 0\n";
+        let t = TubeStats::from_yaml(yaml);
+        assert_eq!(t.pause, 60);
+        assert!(!t.is_paused());
+    }
+
+    #[test]
+    fn parses_timing_extremes_and_samples() {
+        let t = TubeStats::from_yaml(PAUSED_TUBE);
+        assert_eq!(t.processing_time_samples, 28034);
+        assert_eq!(t.queue_time_samples, 28089);
+        assert_eq!(t.bury_rate, 0.0);
+        assert!((t.processing_time_min - 0.000832).abs() < 1e-9);
+        assert!((t.processing_time_max - 77.396080).abs() < 1e-6);
+        assert!((t.processing_time_fast_threshold - 0.1).abs() < 1e-9);
+        assert!((t.queue_time_max - 52790.799139).abs() < 1e-6);
+    }
+
+    #[test]
+    fn missing_pause_fields_default_to_unpaused() {
+        // beanstalkd and older tuber builds may omit these entirely.
+        let t = TubeStats::from_yaml("---\nname: \"x\"\ncurrent-jobs-ready: 1\n");
+        assert_eq!(t.pause, 0);
+        assert_eq!(t.pause_time_left, 0);
+        assert!(!t.is_paused());
     }
 }
 
