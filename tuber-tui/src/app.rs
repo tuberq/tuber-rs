@@ -120,7 +120,7 @@ impl App {
         let mut tubes: Vec<&TubeStats> = snap
             .tubes
             .iter()
-            .filter(|t| !self.hide_empty || !is_idle(t))
+            .filter(|t| !self.hide_empty || !is_empty(t))
             .collect();
         self.sort_tubes(&mut tubes);
         tubes
@@ -133,7 +133,7 @@ impl App {
         if !self.hide_empty {
             return 0;
         }
-        snap.tubes.iter().filter(|t| is_idle(t)).count()
+        snap.tubes.iter().filter(|t| is_empty(t)).count()
     }
 
     /// Tubes worth a row in the timing table: they have timing data *and* are
@@ -240,10 +240,15 @@ impl App {
     }
 }
 
-/// A tube with nothing in it and no pause worth reporting. `current_total`
-/// covers buried, so an empty tube cannot be hiding failures — but a paused
-/// tube at zero is exactly what the pause badge exists to show.
-fn is_idle(tube: &TubeStats) -> bool {
+/// Holding no jobs at all, and not paused. This is about *contents*, not
+/// recent activity: a tube that drained a moment ago counts as empty. Note
+/// that `current_total` covers buried, so an empty tube cannot be hiding
+/// failures — but a paused tube at zero is exactly what the badge exists to
+/// show, so it stays visible.
+///
+/// Distinct from `tube_active`, which is about motion and decides the timing
+/// table's rows.
+fn is_empty(tube: &TubeStats) -> bool {
     tube.current_total() == 0 && !tube.is_paused()
 }
 

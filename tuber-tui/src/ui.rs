@@ -308,14 +308,23 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
     // Key hints live in the title rather than the legend: the legend is nearly
     // 52 columns of colour swatches on its own and would push them off an
-    // 80-column terminal, where they are needed most.
+    // 80-column terminal, where they are needed most. Kept tight enough that
+    // the whole title still fits in 80 columns with a count present.
     let hidden = app.hidden_count();
     let sort = app.sort.label();
-    let title = if hidden > 0 {
-        format!(" Tubes ({sort}, {hidden} idle hidden) \u{2014} \u{2191}\u{2193} p:pause u:unpause s:sort e:idle q:quit ")
+    // The label says what the key will do next, not what state we are in.
+    let toggle = if app.hide_empty {
+        "e:show empty"
     } else {
-        format!(" Tubes ({sort}) \u{2014} \u{2191}\u{2193} p:pause u:unpause s:sort e:idle q:quit ")
+        "e:hide empty"
     };
+    let scope = if hidden > 0 {
+        format!("{sort} \u{00b7} {hidden} hidden")
+    } else {
+        sort.to_string()
+    };
+    let title =
+        format!(" Tubes ({scope}) \u{2191}\u{2193} p:pause u:unpause s:sort {toggle} q:quit ");
     let block = Block::default().borders(Borders::BOTTOM).title(title);
 
     let tubes = app.visible_tubes();
@@ -327,7 +336,7 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
 
     if tubes.is_empty() {
         let msg = if app.hide_empty {
-            " No active tubes (press e to show idle)"
+            " No tubes with jobs (press e to show empty)"
         } else {
             " No tubes"
         };
@@ -637,7 +646,7 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect, timing_rows: us
     if timing_rows == 0 && !all_timing.is_empty() {
         text.push(Line::from(Span::styled(
             format!(
-                " {} active tube{} have timing data \u{2014} resize taller to show",
+                " {} tube{} with recent activity have timing data \u{2014} resize taller to show",
                 all_timing.len(),
                 if all_timing.len() == 1 { "" } else { "s" }
             ),
