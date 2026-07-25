@@ -1,0 +1,35 @@
+name: CI
+
+# Every push and pull request. Until this existed the only workflow was
+# release.yml, which runs on tags alone — so the test suite had never run
+# anywhere but a developer's machine, and a commit that broke it reached main
+# and shipped without complaint.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A newer push to the same branch makes the older run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test --workspace
+
+      # -D warnings is deliberate: a lint that only prints is a lint nobody
+      # reads. The workspace is clean under it, so keeping it that way is the
+      # cheap option. `cargo fmt` is *not* checked — the tree has never been
+      # rustfmt-clean and reformatting it is a separate decision.
+      - run: cargo clippy --workspace --all-targets -- -D warnings

@@ -11,7 +11,46 @@ permissions:
   packages: write
 
 jobs:
+  # Cheap gate in front of the four-target matrix, so a mistake costs seconds
+  # rather than the two minutes a full build takes before failing.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The version in the binary comes from env!("CARGO_PKG_VERSION"), resolved
+      # at compile time — so a tag pushed without bumping Cargo.toml ships a
+      # release named v0.14.0 whose binaries report v0.13.0, and says nothing
+      # about it. This is the one failure mode of keeping Cargo.toml as the
+      # source of truth, and it is worth a check rather than an automation:
+      # patching Cargo.toml from the tag instead would leave the committed
+      # version permanently stale, so building the same commit from source would
+      # report something different from the release.
+      - name: Tag must match Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          crate=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME matches Cargo.toml"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Repeated from ci.yml on purpose: a release should verify the commit it is
+      # actually building rather than trust that a branch run covered it.
+      - run: cargo test --workspace
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   build:
+    needs: verify
     strategy:
       matrix:
         include:
@@ -73,20 +112,43 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the annotated tag object comes with it — a shallow
+      # clone has the ref but not the message.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v6
         with:
           pattern: tuber-*
           merge-multiple: true
 
+      # generate_release_notes builds its summary from merged pull requests, and
+      # this repository commits straight to main — so it had nothing to
+      # summarise and every release read as a bare compare link, while the tag
+      # annotation holding the actual notes never reached the page.
+      - name: Read the tag's annotation
+        id: notes
+        run: |
+          {
+            echo 'body<<TAG_BODY_EOF'
+            git tag -l --format='%(contents)' "$GITHUB_REF_NAME"
+            echo TAG_BODY_EOF
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          body: ${{ steps.notes.outputs.body }}
+          # Still appended, for the commit list and the compare link.
           generate_release_notes: true
           files: |
             tuber-*-*.tar.gz
             tuber-*-*.tar.gz.sha256
 
   docker:
+    # Gated too, so a failing test cannot publish an image tagged `latest`.
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

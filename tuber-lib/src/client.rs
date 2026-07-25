@@ -81,8 +81,9 @@ impl TuberClient {
         for name in &tube_names {
             tubes.push(self.stats_tube(name).await?);
         }
-        // Sort tubes by total_jobs descending
-        tubes.sort_by(|a, b| b.total_jobs.cmp(&a.total_jobs));
+        // Busiest first, so a caller that takes the head of the list gets the
+        // tubes worth looking at. Callers that want another order re-sort.
+        tubes.sort_by_key(|t| std::cmp::Reverse(t.total_jobs));
         Ok(Snapshot {
             server,
             tubes,
