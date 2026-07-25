@@ -90,7 +90,7 @@ A real-time terminal dashboard for monitoring tuber queues.
 ### Features
 
 - Live server stats: version, uptime, connections, CPU usage, drain status
-- Per-tube stacked bar chart with log-scaled segments for ready, reserved, delayed, and buried jobs
+- Per-tube job counts in fixed, colour-coded columns — ready, urgent, reserved, delayed, buried — beside a log-scaled bar sizing each tube against the busiest
 - Throughput rates: puts/s, reserves/s, deletes/s, timeouts/s
 - Bimodal processing time EWMA, percentiles (p50/p95/p99), and queue time per tube
 - Queue growth indicators
@@ -159,20 +159,37 @@ paused tube at zero is exactly the one you need to see.
 ### Layout
 
 ```
-+------------------------------------------------------+
-| Top bar: version, uptime, connections, CPU, drain    |
-+------------------------------------------------------+
-| Tube bar chart (log-scaled, color-coded)             |
-|                                                      |
-|  emails   ████████████████████████           12,345  |
-|  webhooks ██████████████                        567  |
-|  default  ████                                   23  |
-|                                                      |
-|  █ Ready  █ Reserved  █ Delayed  █ Buried            |
-+------------------------------------------------------+
-| Throughput, EWMA, percentiles, buried count          |
-+------------------------------------------------------+
++--------------------------------------------------------------------------+
+| Top bar: version, uptime, connections, CPU, memory, storage, drain       |
++--------------------------------------------------------------------------+
+| Tube table                                                               |
+|                                                                          |
+|                total     ready  urgnt  resvd  delay buried  size         |
+|       book    10.1K —     9.9K      ·      ·      ·    145  ███████░░░   |
+|     covers     1.6M ⇊     1.6M      ·    124     23      ·  ██████████   |
+|       work      907 ↓      109    780      4     14      ·  ████░░░░░░   |
++--------------------------------------------------------------------------+
+| Throughput, EWMA, percentiles, buried count                              |
++--------------------------------------------------------------------------+
 ```
+
+Every job state has a fixed column, right-aligned and coloured, so a count can
+be read down the screen as well as across — a state holding nothing shows a dim
+`·` rather than closing the gap and shifting the columns after it. The header
+labels are drawn in their state colours, so they double as the legend. A state
+that *no* visible tube is using is dropped for the whole frame, which is why the
+example above has no `urgnt` column: alignment never costs width that is not
+carrying information.
+
+The bar sizes each tube against the busiest one on screen, log-scaled, so a tube
+holding one job draws one cell and the lengths are comparable down the column.
+Its fill is split linearly between the states, so the colours read as the real
+mix — a handful of buried jobs in a large queue correctly claims no cell, and the
+red count column is what makes it visible.
+
+On a narrow terminal the bar gives way first, then the timing suffix, then the
+name truncates. The counts and the total are the only numbers on a row that
+appear nowhere else on screen, so they are never traded away.
 
 ## Requirements
 
