@@ -136,18 +136,11 @@ fn split_bottom(avail: usize, visible_tubes: usize, detail_lines: usize) -> (usi
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    let has_storage_line = app
-        .current
-        .as_ref()
-        .map(|s| {
-            let srv = &s.server;
-            srv.binlog_enabled
-                || srv.toast_segments > 0
-                || srv.toast_total_bytes > 0
-                || srv.max_storage_bytes > 0
-        })
-        .unwrap_or(false);
-    let top_height = if has_storage_line { 5 } else { 4 };
+    // Built before the layout so the bar's height follows its content: a server
+    // reporting no storage limits at all has nothing for the second line, and a
+    // row of blanks is worse than no row.
+    let top_lines = top_bar_lines(app);
+    let top_height = (top_lines.len() + 2) as u16;
 
     // Computed once per frame and passed down. Recomputing it in each panel
     // would re-filter and re-sort, and would make the chart and the detail pane
@@ -179,7 +172,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     ])
     .split(area);
 
-    render_top_bar(frame, app, chunks[0]);
+    render_top_bar(frame, app, chunks[0], top_lines);
     render_tube_chart(frame, app, chunks[1], &visible);
     render_bottom_panel(frame, app, chunks[2], detail, detail_rows);
     render_prompt_overlay(frame, app, area);
@@ -272,157 +265,129 @@ fn prompt_line(app: &App, kind: PromptKind, tube: &str, buf: &str) -> Line<'stat
     Line::from(spans)
 }
 
-fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let title = format!(" tuber-tui v{} ", env!("CARGO_PKG_VERSION"));
+fn render_top_bar(frame: &mut Frame, app: &App, area: Rect, lines: Vec<Line<'static>>) {
+    // The address is the client's own answer to "which server is this". The
+    // server's reported hostname is on its detail row, but inside a container
+    // that is the container ID, so it identifies the box rather than the server.
+    let title = match app.addr.is_empty() {
+        true => format!(" tuber-tui v{} ", env!("CARGO_PKG_VERSION")),
+        false => format!(" tuber-tui v{} \u{2014} {} ", env!("CARGO_PKG_VERSION"), app.addr),
+    };
+    let block = Block::default().borders(Borders::BOTTOM).title(title);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
 
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .title(title);
-
-    if let Some(ref err) = app.error {
-        let text = vec![
+/// The top bar's content.
+///
+/// Deliberately short. Everything that used to be here with no other home —
+/// CPU, RSS, the WAL and TOAST breakdowns, the server-wide job counts — is now
+/// either the chart's footer row or the server's detail pane, so the bar keeps
+/// only what you would want to be interrupted by while watching something else.
+/// It was three lines, the widest of them 126 columns, clipping mid-number on a
+/// 94-column terminal.
+fn top_bar_lines(app: &App) -> Vec<Line<'static>> {
+    if let Some(err) = &app.error {
+        return vec![
             Line::from(Span::styled(
                 format!(" Error: {err}"),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )),
             Line::from(" Reconnecting..."),
         ];
-        let p = Paragraph::new(text).block(block);
-        frame.render_widget(p, area);
-        return;
     }
 
     let Some(snap) = &app.current else {
-        let p = Paragraph::new(" Connecting...").block(block);
-        frame.render_widget(p, area);
-        return;
+        return vec![Line::from(" Connecting...")];
     };
-
     let s = &snap.server;
-    let uptime = format_uptime(s.uptime);
 
     let server_version = if s.version.starts_with("tuber") {
         s.version.clone()
     } else {
         format!("beanstalkd {}", s.version)
     };
-
-    let server_label = match snap.server.name.as_str() {
+    let server_label = match s.name.as_str() {
         "" => server_version,
-        name => format!("{server_version} — {name}"),
+        name => format!("{server_version} \u{2014} {name}"),
     };
 
-    let mut line1_spans = vec![
-        Span::styled(" ", Style::default().fg(Color::DarkGray)),
-        Span::raw(server_label),
+    let mut identity = vec![
+        Span::raw(format!(" {server_label}")),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("up {uptime}")),
+        Span::raw(format!("up {}", format_uptime(s.uptime))),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(
             "conns: {} (producers:{} workers:{} waiting:{})",
             s.current_connections, s.current_producers, s.current_workers, s.current_waiting
         )),
     ];
-
     if s.draining {
-        line1_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        line1_spans.push(Span::styled(
+        identity.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        identity.push(Span::styled(
             "DRAINING",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
 
-    let mut line2_spans = vec![
-        Span::styled(" CPU: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("u={:.2} s={:.2}", s.rusage_utime, s.rusage_stime)),
-    ];
-
-    if s.rusage_maxrss > 0 {
-        line2_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        line2_spans.push(Span::styled("RSS: ", Style::default().fg(Color::DarkGray)));
-        line2_spans.push(Span::raw(format_bytes(s.rusage_maxrss)));
-    }
-
+    // Headroom: the numbers that turn into an outage if you look away. Absolute
+    // figures ride along because there is room for them once the detail has gone.
+    let mut headroom: Vec<Vec<Span<'static>>> = Vec::new();
     if s.max_jobs_size > 0 {
         let pct = s.current_jobs_size as f64 / s.max_jobs_size as f64 * 100.0;
-        let color = usage_colour(pct);
-        line2_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        line2_spans.push(Span::styled("Mem: ", Style::default().fg(Color::DarkGray)));
-        line2_spans.push(Span::styled(
-            format!("{} / {} ({:.1}%)", format_bytes(s.current_jobs_size), format_bytes(s.max_jobs_size), pct),
-            Style::default().fg(color),
+        headroom.push(labelled(
+            "Mem",
+            format!(
+                "{:.1}% ({} / {})",
+                pct,
+                format_bytes(s.current_jobs_size),
+                format_bytes(s.max_jobs_size)
+            ),
+            usage_colour(pct),
         ));
     } else if s.current_jobs_size > 0 {
-        line2_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        line2_spans.push(Span::styled("Mem: ", Style::default().fg(Color::DarkGray)));
-        line2_spans.push(Span::raw(format_bytes(s.current_jobs_size)));
+        headroom.push(labelled("Mem", format_bytes(s.current_jobs_size), Color::Reset));
     }
-
-    // The server-wide job breakdown used to live here, 61 columns of it, and was
-    // the single widest thing in the top bar — enough on its own to push this
-    // line off a 94-column terminal. It is now the chart's footer row, which
-    // costs no width because it reuses the count columns.
-
-    let mut line3_spans: Vec<Span> = Vec::new();
-
-    if s.binlog_enabled {
-        line3_spans.push(Span::styled(" WAL: ", Style::default().fg(Color::DarkGray)));
-        line3_spans.push(Span::raw(format!(
-            "{} ({} files)",
-            format_bytes(s.binlog_total_bytes),
-            s.binlog_file_count
-        )));
+    if s.toast_total_bytes > 0 {
+        let pct = s.toast_live_bytes as f64 / s.toast_total_bytes as f64 * 100.0;
+        // Live share, not usage: a low figure is fragmentation awaiting
+        // compaction, so the usual thresholds would colour it backwards.
+        headroom.push(labelled("TOAST", format!("{pct:.0}% live"), Color::Reset));
     }
-
-    if s.toast_segments > 0 || s.toast_total_bytes > 0 {
-        if line3_spans.is_empty() {
-            line3_spans.push(Span::styled(" TOAST: ", Style::default().fg(Color::DarkGray)));
-        } else {
-            line3_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-            line3_spans.push(Span::styled("TOAST: ", Style::default().fg(Color::DarkGray)));
-        }
-        let live_frag = if s.toast_total_bytes > 0 {
-            let pct = s.toast_live_bytes as f64 / s.toast_total_bytes as f64 * 100.0;
-            format!(
-                "{} / {} ({:.0}% live, {} segs)",
-                format_bytes(s.toast_live_bytes),
-                format_bytes(s.toast_total_bytes),
-                pct,
-                s.toast_segments
-            )
-        } else {
-            format!("{} segs", s.toast_segments)
-        };
-        line3_spans.push(Span::raw(live_frag));
-    }
-
     if s.max_storage_bytes > 0 {
         let used = s.binlog_total_bytes + s.toast_total_bytes;
         let pct = used as f64 / s.max_storage_bytes as f64 * 100.0;
-        let color = usage_colour(pct);
-        if line3_spans.is_empty() {
-            line3_spans.push(Span::raw(" "));
-        } else {
-            line3_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        }
-        line3_spans.push(Span::styled("Disk: ", Style::default().fg(Color::DarkGray)));
-        line3_spans.push(Span::styled(
+        headroom.push(labelled(
+            "Disk",
             format!(
-                "{} / {} ({:.1}%)",
+                "{:.1}% ({} / {})",
+                pct,
                 format_bytes(used),
-                format_bytes(s.max_storage_bytes),
-                pct
+                format_bytes(s.max_storage_bytes)
             ),
-            Style::default().fg(color),
+            usage_colour(pct),
         ));
     }
 
-    let mut text = vec![Line::from(line1_spans), Line::from(line2_spans)];
-    if !line3_spans.is_empty() {
-        text.push(Line::from(line3_spans));
+    let mut lines = vec![Line::from(identity)];
+    if !headroom.is_empty() {
+        let mut spans = vec![Span::raw(" ")];
+        for (i, frag) in headroom.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            }
+            spans.extend(frag);
+        }
+        lines.push(Line::from(spans));
     }
-    let p = Paragraph::new(text).block(block);
-    frame.render_widget(p, area);
+    lines
+}
+
+/// `Label: value`, the label dimmed and the value in `colour`.
+fn labelled(label: &str, value: String, colour: Color) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
+        Span::styled(value, Style::default().fg(colour)),
+    ]
 }
 
 /// The chart title, and with it the key hints — the widest form that fits the
@@ -1665,7 +1630,7 @@ mod tests {
     }
 
     fn sample_app(tubes: Vec<TubeStats>) -> App {
-        let mut app = App::new();
+        let mut app = App::new("test:11300".to_string());
         app.update(Snapshot {
             server: ServerStats::from_yaml(
                 "version: tuber 0.13.0\ncurrent-jobs-ready: 2103009\n\
@@ -1941,7 +1906,7 @@ mod tests {
              job-timeouts: 14\ntotal-jobs: 2200000\n\
              processing-time-fast-threshold: 0.1\n",
         );
-        let mut app = App::new();
+        let mut app = App::new("test:11300".to_string());
         app.update(Snapshot { server, tubes: sample_tubes(), fetched_at: Instant::now() });
         app
     }
@@ -1996,6 +1961,57 @@ mod tests {
         assert_eq!(format_secs(252), "5m");
     }
 
+    /// The bar that started this: three lines, the widest 126 columns, clipping
+    /// mid-number on a 94-column terminal.
+    #[test]
+    fn the_top_bar_fits_eighty_columns() {
+        let app = busy_server_app();
+        let lines = draw_frame(&app, 80, 30);
+        // Title, then the bar's own lines, then the chart's bottom border.
+        for (i, line) in lines.iter().take(3).enumerate() {
+            assert!(
+                line.chars().count() <= 80,
+                "top bar line {i} needs {} columns: {line:?}",
+                line.chars().count()
+            );
+        }
+        let bar = lines[1..3].join("\n");
+        // What it keeps: identity, and the headroom you want to be interrupted by.
+        for kept in ["tuber 0.13.0", "up 41m", "workers:35", "Mem:", "TOAST:", "Disk:"] {
+            assert!(bar.contains(kept), "top bar lost {kept}:\n{bar}");
+        }
+        // What moved to the server's detail row, where there is room for it.
+        for moved in ["CPU", "RSS", "ready,", "files"] {
+            assert!(!bar.contains(moved), "top bar still carries {moved}:\n{bar}");
+        }
+    }
+
+    /// The address we dialled titles the frame. It is the only identity of the
+    /// server the client is certain of — the reported hostname is the server's
+    /// own view, which in a container is the container ID.
+    #[test]
+    fn the_title_names_the_server_we_dialled() {
+        let app = busy_server_app();
+        assert!(
+            draw_frame(&app, 80, 30)[0].contains("test:11300"),
+            "no address in the title"
+        );
+    }
+
+    /// A server with no storage limits to report — beanstalkd — has nothing for
+    /// the second line, and gets a shorter bar rather than a row of blanks.
+    #[test]
+    fn the_bar_shrinks_when_there_is_no_headroom_to_report() {
+        let mut app = App::new("test:11300".to_string());
+        app.update(Snapshot {
+            server: ServerStats::from_yaml("version: 1.13\ncurrent-connections: 1\n"),
+            tubes: vec![TubeStats::from_yaml("name: q\ncurrent-jobs-ready: 2\n")],
+            fetched_at: Instant::now(),
+        });
+        assert_eq!(top_bar_lines(&app).len(), 1, "no storage means one line");
+        assert_eq!(top_bar_lines(&busy_server_app()).len(), 2);
+    }
+
     /// A state nothing is using spends no width — neither the visible tubes nor
     /// the server as a whole.
     #[test]
@@ -2004,7 +2020,7 @@ mod tests {
             .into_iter()
             .filter(|t| t.name == "book" || t.name == "series")
             .collect();
-        let mut app = App::new();
+        let mut app = App::new("test:11300".to_string());
         app.update(Snapshot {
             // Ready, delayed and buried only: the totals must not conjure a
             // column that no tube on screen has a number for.
@@ -2025,7 +2041,7 @@ mod tests {
     /// hidden — 2196 buried jobs matter whether or not their tube is on screen.
     #[test]
     fn the_servers_totals_earn_their_columns() {
-        let mut app = App::new();
+        let mut app = App::new("test:11300".to_string());
         app.update(Snapshot {
             server: ServerStats::from_yaml(
                 "version: tuber 0.13.0\ncurrent-jobs-ready: 5\ncurrent-jobs-buried: 2196\n",

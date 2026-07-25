@@ -77,6 +77,13 @@ impl Selection {
 }
 
 pub struct App {
+    /// The address we dialled, as resolved from the argument or `TUBER_ADDR`.
+    ///
+    /// Worth holding because it is the only identity of the server the *client*
+    /// is sure of: `stats` reports the server's own `hostname`, which inside a
+    /// container is the container ID, so it answers "which box is this" rather
+    /// than "which server am I watching".
+    pub addr: String,
     pub current: Option<Snapshot>,
     pub previous: Option<Snapshot>,
     pub error: Option<String>,
@@ -90,8 +97,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(addr: String) -> Self {
         Self {
+            addr,
             current: None,
             previous: None,
             error: None,

@@ -250,8 +250,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = tuber_lib::resolve_addr(cli.addr.as_deref());
     let interval = Duration::from_secs_f64(cli.interval);
 
-    // Kept for command dispatch; the poller takes its own copies.
+    // Kept for command dispatch and for display; the poller takes its own copies.
     let cmd_addr = addr.clone();
+    let addr_label = addr.clone();
     let cmd_tx = tx.clone();
 
     // Poller task
@@ -280,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let mut app = App::new();
+    let mut app = App::new(addr_label);
     let mut event_stream = EventStream::new();
 
     // Initial render

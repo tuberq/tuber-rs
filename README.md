@@ -89,7 +89,7 @@ A real-time terminal dashboard for monitoring tuber queues.
 
 ### Features
 
-- Live server stats: version, uptime, connections, CPU usage, drain status
+- Live server stats: version, uptime, connections, memory and disk headroom, drain status
 - Per-tube job counts in fixed, colour-coded columns — ready, urgent, reserved, delayed, buried — beside a log-scaled bar sizing each tube against the busiest
 - Throughput rates: puts/s, reserves/s, deletes/s, timeouts/s
 - A detail pane for whichever tube the cursor is on: bimodal processing EWMA, percentiles, oldest job ages, bury rate, watcher counts
@@ -161,7 +161,9 @@ paused tube at zero is exactly the one you need to see.
 
 ```
 +------------------------------------------------------------------------+
-| Top bar: version, uptime, connections, CPU, memory, storage, drain     |
+| tuber-tui v0.12.0 - hetz01:11300                                       |
+| tuber 0.13.0 - gr | up 41m | conns: 105 (producers:68 workers:35 ...)   |
+| Mem: 77.7% (875.4MB / 1.1GB) | TOAST: 75% live | Disk: 57.1% (1.1/2.0G)|
 +------------------------------------------------------------------------+
 |              total     ready  urgnt  resvd  delay buried  size         |
 |     book    10.1K —     9.9K      ·      ·      ·    145  ███████░░░   |
@@ -207,6 +209,19 @@ against. `p`, `u` and `K` have no tube to act on there and say so.
 
 The pane's lines are in reading order, so a terminal too short for all of them
 keeps the ones you would have read first and reports the rest in its heading.
+
+The top bar keeps only what you would want to be interrupted by while watching
+something else: which server, how long it has been up, who is connected, and how
+much memory and disk is left. CPU, RSS, the WAL and TOAST breakdowns and the
+server-wide job counts all moved to the `server` row and its pane, which is
+where there is room for them.
+
+The frame is titled with the address the client dialled. That is deliberate: the
+`host` line in the server's pane is the server's *own* view of where it is
+running — `hostname`, `os` and `platform` straight from `stats` — and inside a
+container `hostname` is the container ID, so it identifies the container rather
+than the machine. Set `--hostname` on the container, or give the server a `name`,
+if you want that line to say something recognisable.
 
 On a narrow terminal the bar gives way first, then the timing suffix, then the
 name truncates.On a narrow terminal the bar gives way first, then the timing suffix, then the
