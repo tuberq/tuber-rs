@@ -158,7 +158,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // rather than after — the lines are the measurement.
     let detail = app
         .selected_tube()
-        .map(|tube| tube_detail_lines(tube, app))
+        .map(tube_detail_lines)
         .unwrap_or_default();
 
     let (bottom_height, detail_rows) = split_bottom(
@@ -515,11 +515,6 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
         height: chart_height as u16,
         ..inner
     };
-    let footer_area = Rect {
-        y: inner.y + header_height + chart_height as u16,
-        height: footer_height,
-        ..inner
-    };
 
     // Scroll the window just far enough to keep the cursor on screen. Derived
     // from the selection rather than stored, so it cannot drift out of sync
@@ -630,7 +625,18 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
         lines.push(Line::from(spans));
     }
 
+    let rendered_rows = lines.len();
     let chart = Paragraph::new(lines);
+    // The totals follow the last row rather than sitting at the bottom of the
+    // chart's region. The region absorbs whatever the layout has spare — it is
+    // the flexible one — so pinning the footer to its foot left the totals
+    // stranded a dozen blank rows below the tubes they total.
+    let footer_area = Rect {
+        y: chart_area.y + rendered_rows as u16,
+        height: footer_height,
+        ..inner
+    };
+
     frame.render_widget(chart, chart_area);
 
     let mut header = vec![
@@ -1026,7 +1032,7 @@ fn pair(value: String, label: &str) -> Vec<Span<'static>> {
 /// had room for six columns and nothing else, which left 19 of `TubeStats`'
 /// fields — the oldest job ages, the bury rate, the min/max processing times,
 /// the watcher counts — parsed on every poll and never displayed.
-fn tube_detail_lines(tube: &TubeStats, app: &App) -> Vec<DetailLine> {
+fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
     let mut lines = Vec::new();
     let counts = state_counts(tube);
 
@@ -1055,24 +1061,20 @@ fn tube_detail_lines(tube: &TubeStats, app: &App) -> Vec<DetailLine> {
     });
 
     // Processing time. The bimodal pair is tuber's distinctive signal, so it
-    // leads; the threshold splitting them is the server's, not the tube's.
-    let thresh = app
-        .current
-        .as_ref()
-        .map(|s| s.server.processing_time_fast_threshold)
-        .unwrap_or(0.1);
+    // leads.
+    //
+    // The threshold splitting fast from slow is deliberately not repeated here.
+    // It is server configuration — the same value for every tube and every poll
+    // — so spelling it out on each row cost twelve columns to restate a constant,
+    // and the obvious compact form (`79ms < 100ms ewma > 862ms`) reads as a pair
+    // of inequalities, one of which happens to be true. It belongs with the rest
+    // of the server's settings.
     let mut timing: Vec<Vec<Span<'static>>> = Vec::new();
     if tube.processing_time_samples_fast > 0 {
-        timing.push(pair(
-            tight(tube.processing_time_ewma_fast),
-            &format!("under {}", tight(thresh)),
-        ));
+        timing.push(pair(tight(tube.processing_time_ewma_fast), "fast"));
     }
     if tube.processing_time_samples_slow > 0 {
-        timing.push(pair(
-            tight(tube.processing_time_ewma_slow),
-            &format!("over {}", tight(thresh)),
-        ));
+        timing.push(pair(tight(tube.processing_time_ewma_slow), "slow"));
     }
     if tube.processing_time_p50 > 0.0 {
         timing.push(pair(tight(tube.processing_time_p50), "p50"));
@@ -1606,9 +1608,11 @@ mod tests {
         for value in ["2d3h", "8ms\u{2013}4.2s", "0.02/s", "5 watching", "4 timeouts"] {
             assert!(pane.contains(value), "pane is missing {value}:\n{pane}");
         }
-        // The bimodal pair reads against the server's threshold, not a guess.
-        assert!(pane.contains("79ms under 100ms"), "no fast ewma:\n{pane}");
-        assert!(pane.contains("862ms over 100ms"), "no slow ewma:\n{pane}");
+        // The bimodal pair leads the runtime line. The threshold that splits
+        // them is server configuration and is deliberately not restated here.
+        let runtime = detail_line(&lines, "runtime").unwrap();
+        assert!(runtime.starts_with("79ms fast \u{00b7} 862ms slow"), "runtime reads {runtime:?}");
+        assert!(!runtime.contains("100ms fast"), "threshold restated: {runtime:?}");
         // The tube's name heads the pane.
         assert!(lines.iter().any(|l| l.starts_with(" covers \u{2500}")), "no heading:\n{pane}");
     }
