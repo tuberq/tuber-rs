@@ -97,10 +97,27 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
                     app.set_status(format!("{tube} is not paused"), false);
                     Action::None
                 }
-                None => Action::None,
+                None => {
+                    // Reachable by resting the cursor on the totals row, where
+                    // silence would read as a broken key rather than as a
+                    // command with nothing to act on.
+                    app.set_status(no_tube_reason(app), true);
+                    Action::None
+                }
             }
         }
         _ => Action::None,
+    }
+}
+
+/// Why a tube command has nothing to act on. The server's totals row takes the
+/// cursor like a tube, so this has to name that case rather than claim nothing
+/// is selected while something visibly is.
+fn no_tube_reason(app: &App) -> String {
+    if app.server_selected() {
+        "The server row is selected \u{2014} move to a tube first".to_string()
+    } else {
+        "No tube selected".to_string()
     }
 }
 
@@ -109,7 +126,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
 /// jobs can only ever report "kicked 0".
 fn open_prompt(app: &mut App, kind: PromptKind) {
     let Some(tube) = app.selected_tube() else {
-        app.set_status("No tube selected".to_string(), true);
+        app.set_status(no_tube_reason(app), true);
         return;
     };
     let (available, _) = kick_target(tube.current_jobs_buried, tube.current_jobs_delayed);

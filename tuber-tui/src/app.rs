@@ -52,13 +52,37 @@ pub struct Status {
     pub at: Instant,
 }
 
+/// What the cursor is on.
+///
+/// An enum rather than an `Option<String>` because the server's totals row is
+/// selectable like a tube, and a tube may legitimately be named "server" — so
+/// the row cannot be identified by a sentinel name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Selection {
+    Tube(String),
+    /// The totals row below the last tube. Selecting it turns the detail pane
+    /// over to the server, which is why there is no separate server page: the
+    /// cursor already says what the pane should describe.
+    Server,
+}
+
+impl Selection {
+    /// The tube's name, or `None` when the cursor is on the server row.
+    pub fn tube_name(&self) -> Option<&str> {
+        match self {
+            Selection::Tube(name) => Some(name),
+            Selection::Server => None,
+        }
+    }
+}
+
 pub struct App {
     pub current: Option<Snapshot>,
     pub previous: Option<Snapshot>,
     pub error: Option<String>,
     /// Selection is held by tube *name*, never row index: the list re-sorts
     /// on every poll and an index would slide onto a different tube.
-    pub selected: Option<String>,
+    pub selected: Option<Selection>,
     pub sort: SortMode,
     pub mode: Mode,
     pub hide_empty: bool,
@@ -108,18 +132,28 @@ impl App {
 
     /// Point the cursor at the first visible tube if it currently points at
     /// nothing, or at a tube that has vanished or been filtered out.
+    ///
+    /// The server row is always a valid target, so a cursor resting there is
+    /// never disturbed — and it is where the cursor lands when there are no
+    /// tubes to point at, rather than nowhere.
     pub fn reconcile_selection(&mut self) {
+        if self.selected == Some(Selection::Server) {
+            return;
+        }
         // Scoped so the borrow ends before `selected` is assigned; only the one
         // replacement name is cloned, not every visible tube's name.
         let replacement = {
             let tubes = self.visible_tubes();
             match self.index_of_selected(&tubes) {
                 Some(_) => None,
-                None => Some(tubes.first().map(|t| t.name.clone())),
+                None => Some(match tubes.first() {
+                    Some(t) => Selection::Tube(t.name.clone()),
+                    None => Selection::Server,
+                }),
             }
         };
-        if let Some(name) = replacement {
-            self.selected = name;
+        if let Some(selection) = replacement {
+            self.selected = Some(selection);
         }
     }
 
@@ -188,21 +222,33 @@ impl App {
     /// encoding of "the cursor is on a real row" — callers that already hold
     /// the list should use this rather than recomputing it.
     pub fn index_of_selected(&self, tubes: &[&TubeStats]) -> Option<usize> {
-        let name = self.selected.as_ref()?;
-        tubes.iter().position(|t| &t.name == name)
+        let name = self.selected.as_ref()?.tube_name()?;
+        tubes.iter().position(|t| t.name == name)
     }
 
+    /// True when the cursor is on the server's totals row.
+    pub fn server_selected(&self) -> bool {
+        self.selected == Some(Selection::Server)
+    }
+
+    /// Move the cursor over the visible tubes and the server row below them,
+    /// which is one list as far as navigation is concerned — pressing down past
+    /// the last tube lands on the totals rather than stopping.
     pub fn move_selection(&mut self, delta: isize) {
-        let next_name = {
+        let next = {
             let tubes = self.visible_tubes();
-            if tubes.is_empty() {
-                return;
+            // The server row is the last position, so the list is never empty.
+            let server_row = tubes.len() as isize;
+            let current = match self.selected {
+                Some(Selection::Server) => server_row,
+                _ => self.index_of_selected(&tubes).unwrap_or(0) as isize,
+            };
+            match (current + delta).clamp(0, server_row) {
+                row if row == server_row => Selection::Server,
+                row => Selection::Tube(tubes[row as usize].name.clone()),
             }
-            let current = self.index_of_selected(&tubes).unwrap_or(0) as isize;
-            let next = (current + delta).clamp(0, tubes.len() as isize - 1) as usize;
-            tubes[next].name.clone()
         };
-        self.selected = Some(next_name);
+        self.selected = Some(next);
     }
 
     /// A tube's stats from the latest snapshot.
@@ -210,9 +256,10 @@ impl App {
         self.current.as_ref()?.tubes.iter().find(|t| t.name == name)
     }
 
-    /// The selected tube's stats, if the cursor is on one.
+    /// The selected tube's stats, if the cursor is on one. `None` when it is on
+    /// the server row, which is what makes the tube commands refuse there.
     pub fn selected_tube(&self) -> Option<&TubeStats> {
-        self.tube_by_name(self.selected.as_deref()?)
+        self.tube_by_name(self.selected.as_ref()?.tube_name()?)
     }
 
     /// Calculate rate (per second) of a cumulative counter between snapshots.

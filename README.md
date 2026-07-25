@@ -92,7 +92,8 @@ A real-time terminal dashboard for monitoring tuber queues.
 - Live server stats: version, uptime, connections, CPU usage, drain status
 - Per-tube job counts in fixed, colour-coded columns — ready, urgent, reserved, delayed, buried — beside a log-scaled bar sizing each tube against the busiest
 - Throughput rates: puts/s, reserves/s, deletes/s, timeouts/s
-- Bimodal processing time EWMA, percentiles (p50/p95/p99), and queue time per tube
+- A detail pane for whichever tube the cursor is on: bimodal processing EWMA, percentiles, oldest job ages, bury rate, watcher counts
+- Server totals as a footer row on the table, selectable like a tube to turn the pane over to the server
 - Queue growth indicators
 - Buried job highlighting
 - Auto-reconnect on connection loss
@@ -127,7 +128,7 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 
 | Key | Action |
 |---|---|
-| `↑` `↓` / `k` `j` | Move the tube cursor |
+| `↑` `↓` / `k` `j` | Move the cursor over the tubes, then the server row |
 | `p` | Pause the selected tube — prompts for a duration |
 | `u` | Unpause the selected tube immediately |
 | `K` | Kick the selected tube — prompts for how many jobs |
@@ -159,27 +160,36 @@ paused tube at zero is exactly the one you need to see.
 ### Layout
 
 ```
-+--------------------------------------------------------------------------+
-| Top bar: version, uptime, connections, CPU, memory, storage, drain       |
-+--------------------------------------------------------------------------+
-| Tube table                                                               |
-|                                                                          |
-|                total     ready  urgnt  resvd  delay buried  size         |
-|       book    10.1K —     9.9K      ·      ·      ·    145  ███████░░░   |
-|     covers     1.6M ⇊     1.6M      ·    124     23      ·  ██████████   |
-|       work      907 ↓      109    780      4     14      ·  ████░░░░░░   |
-+--------------------------------------------------------------------------+
-| Throughput, EWMA, percentiles, buried count                              |
-+--------------------------------------------------------------------------+
++------------------------------------------------------------------------+
+| Top bar: version, uptime, connections, CPU, memory, storage, drain     |
++------------------------------------------------------------------------+
+|              total     ready  urgnt  resvd  delay buried  size         |
+|     book    10.1K —     9.9K      ·      ·      ·    145  ███████░░░   |
+|   covers     1.6M ⇊     1.6M      ·    124     23      ·  ██████████   |
+|     work      907 ↓      109    780      4     14      ·  ████░░░░░░   |
+|             ────────────────────────────────────────────               |
+|▌   server     1.9M       1.9M    988    343     17   1.0K              |
++------------------------------------------------------------------------+
+| Throughput: 0.2 puts/s  16.5 reserves/s  177.7 deletes/s  (2.2M total) |
+| Timeouts: 0.0/s  Buried: 1043 total                                    |
+| covers ----------------------------------------------------------------|
+| jobs     1.6M ready · 124 delayed · 23 buried                          |
+| runtime  79ms fast · 862ms slow · 100ms p50 · 1.3s p95 · 1.6s p99      |
+| oldest   4m12s ready · 1m3s delayed · 2d3h buried                      |
+| waiting  41.7m in queue · 8ms-4.2s over 1.2M runs · 0.02/s buried      |
+| clients  3 using · 5 watching · 0 waiting · 1.2M reserves · 4 timeouts |
++------------------------------------------------------------------------+
 ```
 
 Every job state has a fixed column, right-aligned and coloured, so a count can
 be read down the screen as well as across — a state holding nothing shows a dim
 `·` rather than closing the gap and shifting the columns after it. The header
 labels are drawn in their state colours, so they double as the legend. A state
-that *no* visible tube is using is dropped for the whole frame, which is why the
-example above has no `urgnt` column: alignment never costs width that is not
-carrying information.
+that neither any visible tube nor the server as a whole is using is dropped for
+the whole frame, so alignment never costs width that is not carrying
+information. The `urgnt` column above survives on the server's 988 alone —
+every tube on screen shows a placeholder there, but the jobs exist in tubes the
+filter is hiding, and a state with a total needs a column to put it in.
 
 The bar sizes each tube against the busiest one on screen, log-scaled, so a tube
 holding one job draws one cell and the lengths are comparable down the column.
@@ -187,7 +197,19 @@ Its fill is split linearly between the states, so the colours read as the real
 mix — a handful of buried jobs in a large queue correctly claims no cell, and the
 red count column is what makes it visible.
 
+The `server` row carries the whole server's totals in those same columns. They
+are the server's own figures rather than the sum of the rows above, which would
+change as you scroll or as `e` hides and shows tubes. It takes the cursor like a
+tube: select it and the pane below describes the server instead — rates, memory
+and disk headroom, the WAL and TOAST counters, anything the server has had to
+repair, and the fast/slow threshold the per-tube runtime line is measured
+against. `p`, `u` and `K` have no tube to act on there and say so.
+
+The pane's lines are in reading order, so a terminal too short for all of them
+keeps the ones you would have read first and reports the rest in its heading.
+
 On a narrow terminal the bar gives way first, then the timing suffix, then the
+name truncates.On a narrow terminal the bar gives way first, then the timing suffix, then the
 name truncates. The counts and the total are the only numbers on a row that
 appear nowhere else on screen, so they are never traded away.
 

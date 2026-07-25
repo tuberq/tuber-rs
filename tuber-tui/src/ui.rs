@@ -155,11 +155,16 @@ pub fn render(frame: &mut Frame, app: &App) {
     let visible = app.visible_tubes();
 
     // The pane's content decides its height, so it is built before the layout
-    // rather than after — the lines are the measurement.
-    let detail = app
-        .selected_tube()
-        .map(tube_detail_lines)
-        .unwrap_or_default();
+    // rather than after — the lines are the measurement. Which set of lines
+    // depends only on where the cursor is; there is no mode to be in.
+    let detail = match app.selected_tube() {
+        Some(tube) => tube_detail_lines(tube),
+        None if app.server_selected() => match app.current.as_ref() {
+            Some(snap) => server_detail_lines(&snap.server, app),
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
 
     let (bottom_height, detail_rows) = split_bottom(
         area.height.saturating_sub(top_height) as usize,
@@ -340,13 +345,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     if s.max_jobs_size > 0 {
         let pct = s.current_jobs_size as f64 / s.max_jobs_size as f64 * 100.0;
-        let color = if pct >= 90.0 {
-            Color::Red
-        } else if pct >= 70.0 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
+        let color = usage_colour(pct);
         line2_spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
         line2_spans.push(Span::styled("Mem: ", Style::default().fg(Color::DarkGray)));
         line2_spans.push(Span::styled(
@@ -400,13 +399,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     if s.max_storage_bytes > 0 {
         let used = s.binlog_total_bytes + s.toast_total_bytes;
         let pct = used as f64 / s.max_storage_bytes as f64 * 100.0;
-        let color = if pct >= 90.0 {
-            Color::Red
-        } else if pct >= 70.0 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
+        let color = usage_colour(pct);
         if line3_spans.is_empty() {
             line3_spans.push(Span::raw(" "));
         } else {
@@ -680,11 +673,22 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
                 Rect { height: 1, ..footer_area },
             );
 
+            // The totals row takes the cursor like any other, because it is
+            // selectable like any other — that is what turns the detail pane
+            // over to the server.
+            let on_server = app.server_selected();
             let mut row = vec![
-                Span::raw(" ".repeat(CURSOR_WIDTH as usize)),
+                Span::styled(
+                    if on_server { "\u{258c}" } else { " " },
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::styled(
                     format!("{:>width$}", "server", width = name_width),
-                    Style::default().fg(Color::DarkGray),
+                    if on_server {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
                 ),
                 Span::styled(
                     format!("{:>width$}", format_number(totals.iter().sum()), width = GAP + TOTAL_WIDTH),
@@ -946,11 +950,11 @@ fn render_bottom_panel(
 
     let mut text = vec![line1, Line::from(line2_spans)];
 
-    // The selected tube's detail, trimmed to the rows the layout allowed. The
+    // Whatever the cursor is on, trimmed to the rows the layout allowed. The
     // lines are already in reading order, so a truncated pane keeps its most
     // useful half rather than an arbitrary one.
     if detail_rows > 0 {
-        if let Some(name) = app.selected.as_deref() {
+        if let Some(name) = app.selected.as_ref().map(|s| s.tube_name().unwrap_or("server")) {
             let rule = area.width as usize;
             let heading = format!(" {name} ");
             // A dropped line is worth saying so — an absent `oldest` row reads
@@ -1017,12 +1021,17 @@ fn joined(parts: Vec<Vec<Span<'static>>>) -> Vec<Span<'static>> {
     out
 }
 
-/// `value label` with the value plain and the unit dimmed.
+/// `value label` with the value plain and the unit dimmed. An empty label emits
+/// no separator — it used to leave a stray space before the next middot.
 fn pair(value: String, label: &str) -> Vec<Span<'static>> {
-    vec![
-        Span::raw(value),
-        Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray)),
-    ]
+    let mut spans = vec![Span::raw(value)];
+    if !label.is_empty() {
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
 }
 
 /// Everything worth knowing about one tube, in reading order — the lines that
@@ -1156,6 +1165,231 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
     }
 
     lines
+}
+
+/// Everything worth knowing about the server, in reading order — rates first,
+/// then what could run out, then what has gone wrong, then trivia.
+///
+/// This is why there is no server page. The cursor already distinguishes a tube
+/// from the totals row, so the pane it drives can describe either; a page would
+/// have added a mode and a keybinding to say the same thing.
+///
+/// It also gives a home to the 16 `ServerStats` fields nothing rendered — the
+/// WAL index range, the TOAST compaction counters, the corrupted and orphaned
+/// body tallies, the command totals, the host triple — and to the fast/slow
+/// threshold, which is server configuration and so belongs here rather than
+/// restated on every tube's runtime line.
+fn server_detail_lines(server: &ServerStats, app: &App) -> Vec<DetailLine> {
+    let mut lines = Vec::new();
+    let (puts_s, reserves_s, deletes_s, timeouts_s) = app.server_rates();
+
+    lines.push(DetailLine {
+        label: "rates",
+        spans: joined(vec![
+            pair(format!("{puts_s:.1}"), "puts/s"),
+            pair(format!("{reserves_s:.1}"), "reserves/s"),
+            pair(format!("{deletes_s:.1}"), "deletes/s"),
+            if timeouts_s > 0.0 {
+                vec![Span::styled(
+                    format!("{timeouts_s:.1} timeouts/s"),
+                    Style::default().fg(Color::Yellow),
+                )]
+            } else {
+                Vec::new()
+            },
+        ]),
+    });
+
+    // What could run out. Percentages carry the same thresholds the top bar
+    // uses, so a number that is fine there is not alarming here.
+    let mut memory = vec![match server.max_jobs_size {
+        0 => pair(format_bytes(server.current_jobs_size), "in jobs"),
+        max => {
+            let pct = server.current_jobs_size as f64 / max as f64 * 100.0;
+            vec![
+                Span::styled(
+                    format!(
+                        "{} / {} ({:.1}%)",
+                        format_bytes(server.current_jobs_size),
+                        format_bytes(max),
+                        pct
+                    ),
+                    Style::default().fg(usage_colour(pct)),
+                ),
+                Span::styled(" in jobs", Style::default().fg(Color::DarkGray)),
+            ]
+        }
+    }];
+    if server.rusage_maxrss > 0 {
+        memory.push(pair(format_bytes(server.rusage_maxrss), "peak RSS"));
+    }
+    if server.max_job_size > 0 {
+        memory.push(pair(format_bytes(server.max_job_size), "max job"));
+    }
+    lines.push(DetailLine { label: "memory", spans: joined(memory) });
+
+    if server.max_storage_bytes > 0 {
+        let used = server.binlog_total_bytes + server.toast_total_bytes;
+        let pct = used as f64 / server.max_storage_bytes as f64 * 100.0;
+        lines.push(DetailLine {
+            label: "disk",
+            spans: vec![Span::styled(
+                format!(
+                    "{} / {} ({:.1}%)",
+                    format_bytes(used),
+                    format_bytes(server.max_storage_bytes),
+                    pct
+                ),
+                Style::default().fg(usage_colour(pct)),
+            )],
+        });
+    }
+
+    if server.binlog_enabled {
+        lines.push(DetailLine {
+            label: "wal",
+            spans: joined(vec![
+                pair(format_bytes(server.binlog_total_bytes), "written"),
+                pair(
+                    format!("{} file{}", server.binlog_file_count, plural(server.binlog_file_count as usize)),
+                    "on disk",
+                ),
+                // The index range says how far replay would have to reach.
+                if server.binlog_current_index > 0 {
+                    pair(
+                        format!("{}\u{2013}{}", server.binlog_oldest_index, server.binlog_current_index),
+                        "index",
+                    )
+                } else {
+                    Vec::new()
+                },
+            ]),
+        });
+    }
+
+    if server.toast_segments > 0 || server.toast_total_bytes > 0 {
+        let mut toast = Vec::new();
+        if server.toast_total_bytes > 0 {
+            let pct = server.toast_live_bytes as f64 / server.toast_total_bytes as f64 * 100.0;
+            // Abbreviated deliberately: with every counter present this line is
+            // the widest the pane produces, and it has to fit 80 columns.
+            toast.push(pair(
+                format!(
+                    "{} / {} {:.0}% live",
+                    format_bytes(server.toast_live_bytes),
+                    format_bytes(server.toast_total_bytes),
+                    pct
+                ),
+                "",
+            ));
+        }
+        toast.push(pair(format!("{} segs", server.toast_segments), ""));
+        if server.toast_compactions_total > 0 {
+            toast.push(pair(format_number(server.toast_compactions_total), "compacted"));
+        }
+        if server.toast_bodies_migrated_total > 0 {
+            toast.push(pair(format_number(server.toast_bodies_migrated_total), "migrated"));
+        }
+        lines.push(DetailLine { label: "toast", spans: joined(toast) });
+    }
+
+    // Anything the server has had to repair or give up on. Absent when all
+    // zero, which is the normal case — so its presence is itself the signal.
+    let repairs = joined(
+        [
+            ("corrupted", server.toast_bodies_dropped_corrupted, Color::Red),
+            ("recovered", server.recovered_missing_bodies, Color::Yellow),
+            ("orphans", server.reclaimed_orphan_bodies, Color::Yellow),
+            ("stranded", server.reclaimed_stranded_bodies, Color::Yellow),
+        ]
+        .into_iter()
+        .filter(|(_, n, _)| *n > 0)
+        .map(|(label, n, colour)| {
+            vec![Span::styled(
+                format!("{} {label}", format_number(n)),
+                Style::default().fg(colour),
+            )]
+        })
+        .collect(),
+    );
+    if !repairs.is_empty() {
+        lines.push(DetailLine { label: "repairs", spans: repairs });
+    }
+
+    lines.push(DetailLine {
+        label: "clients",
+        spans: joined(vec![
+            pair(server.current_connections.to_string(), "connections"),
+            pair(server.current_producers.to_string(), "producers"),
+            pair(server.current_workers.to_string(), "workers"),
+            pair(server.current_waiting.to_string(), "waiting"),
+        ]),
+    });
+
+    lines.push(DetailLine {
+        label: "cpu",
+        spans: joined(vec![
+            pair(format!("{:.2}", server.rusage_utime), "user"),
+            pair(format!("{:.2}", server.rusage_stime), "system"),
+        ]),
+    });
+
+    lines.push(DetailLine {
+        label: "commands",
+        spans: joined(vec![
+            pair(format_number(server.cmd_put), "puts"),
+            pair(
+                format_number(server.cmd_reserve + server.cmd_reserve_with_timeout),
+                "reserves",
+            ),
+            pair(format_number(server.cmd_delete), "deletes"),
+            if server.job_timeouts > 0 {
+                vec![Span::styled(
+                    format!("{} timeouts", format_number(server.job_timeouts)),
+                    Style::default().fg(Color::Yellow),
+                )]
+            } else {
+                Vec::new()
+            },
+        ]),
+    });
+
+    lines.push(DetailLine {
+        label: "tuning",
+        spans: joined(vec![
+            pair(tight(server.processing_time_fast_threshold), "fast/slow split"),
+            pair(format_number(server.total_jobs), "jobs ever"),
+        ]),
+    });
+
+    let host = joined(
+        [
+            server.hostname.as_str(),
+            server.os.as_str(),
+            server.platform.as_str(),
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| vec![Span::raw(s.to_string())])
+        .collect(),
+    );
+    if !host.is_empty() {
+        lines.push(DetailLine { label: "host", spans: host });
+    }
+
+    lines
+}
+
+/// The colour a used-of-available percentage earns. Shared so the top bar and
+/// the server pane cannot disagree about what counts as alarming.
+fn usage_colour(pct: f64) -> Color {
+    if pct >= 90.0 {
+        Color::Red
+    } else if pct >= 70.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
 }
 
 /// Seconds as an age: `45s`, `4m12s`, `2h5m`, `3d4h`.
@@ -1292,7 +1526,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::Instant;
-    use tuber_lib::model::{ServerStats, Snapshot};
+    use crate::app::Selection;
+    use tuber_lib::model::Snapshot;
 
     /// Rows the chart is left with, given the split.
     fn chart_rows(avail: usize, bottom: usize) -> usize {
@@ -1560,7 +1795,7 @@ mod tests {
 
     fn app_with_selection(tubes: Vec<TubeStats>, selected: &str) -> App {
         let mut app = sample_app(tubes);
-        app.selected = Some(selected.to_string());
+        app.selected = Some(Selection::Tube(selected.to_string()));
         app
     }
 
@@ -1655,6 +1890,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The server pane produces the widest lines in the app, so it gets its own
+    /// sweep — the tube-selection one above missed a `toast` line running to 94
+    /// columns because it never selected the server row.
+    #[test]
+    fn the_server_pane_fits_eighty_columns() {
+        let mut app = busy_server_app();
+        app.selected = Some(Selection::Server);
+        let lines = draw_frame(&app, 80, 34);
+        let pane_labels = ["rates", "memory", "disk", "wal", "toast", "repairs", "clients"];
+        for label in pane_labels {
+            let content = detail_line(&lines, label)
+                .unwrap_or_else(|| panic!("no {label} line:\n{}", lines.join("\n")));
+            // The rendered line is a leading space, the label field, then this.
+            let rendered = 1 + DETAIL_LABEL + content.chars().count();
+            assert!(rendered <= 80, "{label} needs {rendered} columns: {content:?}");
+        }
+        // The fast/slow threshold has a home again, now that the runtime line
+        // no longer restates it.
+        assert!(
+            detail_line(&lines, "tuning").unwrap().contains("100ms fast/slow split"),
+            "threshold missing from the server pane"
+        );
+        // Fields that were parsed on every poll and rendered nowhere.
+        assert!(detail_line(&lines, "wal").unwrap().contains("12\u{2013}46"), "no WAL index range");
+        assert!(detail_line(&lines, "repairs").unwrap().contains("2 corrupted"), "no repairs");
+        assert!(detail_line(&lines, "commands").unwrap().contains("2.2M puts"), "no commands");
+    }
+
+    /// A server with every optional field populated.
+    fn busy_server_app() -> App {
+        let server = ServerStats::from_yaml(
+            "version: tuber 0.13.0\nname: gr\nuptime: 2460\nhostname: hetz01\n\
+             os: Linux 6.1\nplatform: x86_64\ncurrent-connections: 105\n\
+             current-producers: 68\ncurrent-workers: 35\ncurrent-waiting: 0\n\
+             current-jobs-ready: 2103009\ncurrent-jobs-urgent: 342\n\
+             current-jobs-reserved: 381\ncurrent-jobs-delayed: 30\n\
+             current-jobs-buried: 2196\nrusage-utime: 59.76\nrusage-stime: 29.79\n\
+             rusage-maxrss: 1181116006\ncurrent-jobs-size: 917901312\n\
+             max-jobs-size: 1181116006\nmax-job-size: 65536\n\
+             binlog-enabled: true\nbinlog-total-bytes: 470220800\n\
+             binlog-file-count: 46\nbinlog-current-index: 46\nbinlog-oldest-index: 12\n\
+             toast-total-bytes: 754974720\ntoast-live-bytes: 568377344\n\
+             toast-segments: 12\ntoast-compactions-total: 318\n\
+             toast-bodies-migrated-total: 41200\ntoast-bodies-dropped-corrupted: 2\n\
+             reclaimed-orphan-bodies: 7\nmax-storage-bytes: 2147483648\n\
+             cmd-put: 2200000\ncmd-reserve: 1900000\ncmd-delete: 2100000\n\
+             job-timeouts: 14\ntotal-jobs: 2200000\n\
+             processing-time-fast-threshold: 0.1\n",
+        );
+        let mut app = App::new();
+        app.update(Snapshot { server, tubes: sample_tubes(), fetched_at: Instant::now() });
+        app
+    }
+
+    /// Down past the last tube lands on the totals row, and the tube commands
+    /// have nothing to act on there.
+    #[test]
+    fn the_cursor_reaches_the_server_row() {
+        let mut app = busy_server_app();
+        let tubes = app.visible_tubes().len();
+        app.selected = Some(Selection::Tube("book".to_string()));
+        for _ in 0..tubes {
+            app.move_selection(1);
+        }
+        assert!(app.server_selected(), "down past the last tube missed the server row");
+        assert!(app.selected_tube().is_none(), "the server row is not a tube");
+        // And back up again onto the last tube.
+        app.move_selection(-1);
+        assert!(!app.server_selected());
+        assert!(app.selected_tube().is_some(), "up from the server row missed the tubes");
     }
 
     /// A squeezed pane keeps its first lines and says how many it dropped, in
