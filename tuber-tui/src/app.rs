@@ -95,13 +95,17 @@ impl App {
     /// Point the cursor at the first visible tube if it currently points at
     /// nothing, or at a tube that has vanished or been filtered out.
     pub fn reconcile_selection(&mut self) {
-        let visible: Vec<String> = self.visible_tubes().iter().map(|t| t.name.clone()).collect();
-        let lost = match &self.selected {
-            Some(name) => !visible.contains(name),
-            None => true,
+        // Scoped so the borrow ends before `selected` is assigned; only the one
+        // replacement name is cloned, not every visible tube's name.
+        let replacement = {
+            let tubes = self.visible_tubes();
+            match self.index_of_selected(&tubes) {
+                Some(_) => None,
+                None => Some(tubes.first().map(|t| t.name.clone())),
+            }
         };
-        if lost {
-            self.selected = visible.first().cloned();
+        if let Some(name) = replacement {
+            self.selected = name;
         }
     }
 
@@ -114,45 +118,37 @@ impl App {
         self.sort = self.sort.next();
     }
 
-    /// Tubes shown in the chart, filtered and sorted. Single source of truth
-    /// for both rendering and cursor movement, so the two cannot disagree.
-    pub fn visible_tubes(&self) -> Vec<&TubeStats> {
+    /// Total tubes the server reported, before any filtering.
+    pub fn tube_count(&self) -> usize {
+        self.current.as_ref().map_or(0, |snap| snap.tubes.len())
+    }
+
+    /// Tubes matching `keep`, in display order.
+    fn filtered_tubes(&self, keep: impl Fn(&TubeStats) -> bool) -> Vec<&TubeStats> {
         let Some(snap) = &self.current else {
             return Vec::new();
         };
-        let mut tubes: Vec<&TubeStats> = snap
-            .tubes
-            .iter()
-            .filter(|t| !self.hide_empty || !is_empty(t))
-            .collect();
+        let mut tubes: Vec<&TubeStats> = snap.tubes.iter().filter(|t| keep(t)).collect();
         self.sort_tubes(&mut tubes);
         tubes
     }
 
-    pub fn hidden_count(&self) -> usize {
-        let Some(snap) = &self.current else {
-            return 0;
-        };
-        if !self.hide_empty {
-            return 0;
-        }
-        snap.tubes.iter().filter(|t| is_empty(t)).count()
+    /// Tubes shown in the chart. Single source of truth for both rendering and
+    /// cursor movement, so the two cannot disagree — callers should compute
+    /// this once per frame and pass the slice down.
+    pub fn visible_tubes(&self) -> Vec<&TubeStats> {
+        self.filtered_tubes(|t| !self.hide_empty || !is_empty(t) || pinned(t))
     }
 
     /// Tubes worth a row in the timing table: they have timing data *and* are
     /// doing something. `processing_time_ewma` alone is a lifetime property
     /// that never decays, so it would list every tube the server has ever run.
+    ///
+    /// Deliberately *not* a subset of `visible_tubes`: a tube that drained a
+    /// moment ago is hidden from the chart but its percentiles are still the
+    /// most interesting thing on screen.
     pub fn timing_tubes(&self) -> Vec<&TubeStats> {
-        let Some(snap) = &self.current else {
-            return Vec::new();
-        };
-        let mut tubes: Vec<&TubeStats> = snap
-            .tubes
-            .iter()
-            .filter(|t| t.processing_time_ewma > 0.0 && self.tube_active(t))
-            .collect();
-        self.sort_tubes(&mut tubes);
-        tubes
+        self.filtered_tubes(|t| t.processing_time_ewma > 0.0 && self.tube_active(t))
     }
 
     /// Holding jobs now, or having moved any since the last poll.
@@ -175,23 +171,25 @@ impl App {
         }
     }
 
-    pub fn selected_index(&self) -> Option<usize> {
+    /// Row of the cursor within an already-computed visible list. The single
+    /// encoding of "the cursor is on a real row" — callers that already hold
+    /// the list should use this rather than recomputing it.
+    pub fn index_of_selected(&self, tubes: &[&TubeStats]) -> Option<usize> {
         let name = self.selected.as_ref()?;
-        self.visible_tubes().iter().position(|t| &t.name == name)
+        tubes.iter().position(|t| &t.name == name)
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        let names: Vec<String> = self.visible_tubes().iter().map(|t| t.name.clone()).collect();
-        if names.is_empty() {
-            return;
-        }
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|n| names.iter().position(|x| x == n))
-            .unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, names.len() as isize - 1) as usize;
-        self.selected = Some(names[next].clone());
+        let next_name = {
+            let tubes = self.visible_tubes();
+            if tubes.is_empty() {
+                return;
+            }
+            let current = self.index_of_selected(&tubes).unwrap_or(0) as isize;
+            let next = (current + delta).clamp(0, tubes.len() as isize - 1) as usize;
+            tubes[next].name.clone()
+        };
+        self.selected = Some(next_name);
     }
 
     /// The selected tube's stats, if the cursor is on one.
@@ -243,16 +241,22 @@ impl App {
     }
 }
 
-/// Holding no jobs at all, and not paused. This is about *contents*, not
-/// recent activity: a tube that drained a moment ago counts as empty. Note
-/// that `current_total` covers buried, so an empty tube cannot be hiding
-/// failures — but a paused tube at zero is exactly what the badge exists to
-/// show, so it stays visible.
+/// Holding no jobs at all. Purely about *contents*, not recent activity: a
+/// tube that drained a moment ago counts as empty. `current_total` covers
+/// buried, so an empty tube cannot be hiding failures.
 ///
 /// Distinct from `tube_active`, which is about motion and decides the timing
 /// table's rows.
 fn is_empty(tube: &TubeStats) -> bool {
-    tube.current_total() == 0 && !tube.is_paused()
+    tube.current_total() == 0
+}
+
+/// Reasons a tube stays on screen even when empty tubes are hidden. Kept
+/// separate from `is_empty` so visibility policy can grow without overloading
+/// what "empty" means: a paused tube at zero is exactly what the badge exists
+/// to show.
+fn pinned(tube: &TubeStats) -> bool {
+    tube.is_paused()
 }
 
 /// Parse a pause duration. Bare numbers are seconds, matching

@@ -1,4 +1,5 @@
 use crate::app::{format_secs, parse_duration, App, Mode};
+use tuber_lib::model::TubeStats;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -9,9 +10,15 @@ use ratatui::Frame;
 const CHART_OVERHEAD: usize = 2;
 /// Tube rows the chart keeps even when the timing table wants more space.
 const CHART_MIN_ROWS: usize = 4;
-/// Stats panel rows that are always present: top border, two summary lines,
-/// and the padding the original layout allowed for.
+/// Stats panel rows that are always present: top border, the two summary
+/// lines, and two spare — the spares carry the optional "+N more" / "resize
+/// taller" note and the blank tail the original layout allowed for.
 const STATS_FIXED: usize = 5;
+/// Most of the space below the top bar the chart may claim before the timing
+/// table gets a look in.
+const CHART_MAX_SHARE: (usize, usize) = (2, 3);
+/// Width of the selection cursor column.
+const CURSOR_WIDTH: u16 = 1;
 
 /// Split the space below the top bar between the tube chart and the timing
 /// table. The chart is the primary widget and is served first; the timing
@@ -25,8 +32,9 @@ fn split_bottom(avail: usize, visible_tubes: usize, timing_tubes: usize) -> (usi
 
     // The chart is served first, but it cannot claim the whole screen just
     // because it has a lot of tubes — it scrolls, so it does not need a row
-    // per tube. Two thirds, then the timing table gets the remainder.
-    let chart_cap = (avail * 2 / 3).max(chart_floor);
+    // per tube. It takes at most its share, then the timing table gets the rest.
+    let (share_num, share_den) = CHART_MAX_SHARE;
+    let chart_cap = (avail * share_num / share_den).max(chart_floor);
     let chart_want = (visible_tubes + CHART_OVERHEAD).clamp(chart_floor, chart_cap);
 
     // The chart never gives up its floor, so this is a hard ceiling.
@@ -35,17 +43,19 @@ fn split_bottom(avail: usize, visible_tubes: usize, timing_tubes: usize) -> (usi
         return (ceiling, 0);
     }
 
-    let leftover = avail.saturating_sub(chart_want);
-    let mut rows = timing_tubes.min(leftover.saturating_sub(STATS_FIXED));
+    // Budget the header row up front, so `rows` is decided once rather than
+    // computed against one limit and then re-clamped against another.
+    let budget = avail
+        .saturating_sub(chart_want)
+        .min(ceiling)
+        .saturating_sub(STATS_FIXED + 1);
+    let mut rows = timing_tubes.min(budget);
     // One or two rows plus a "+N more" marker tells you nothing; spend the
     // space on the chart instead.
     if rows < 3 && rows < timing_tubes {
         rows = 0;
     }
-    let header = usize::from(rows > 0);
-    let height = (STATS_FIXED + header + rows).min(ceiling);
-    let rows = rows.min(height.saturating_sub(STATS_FIXED + header));
-    (height, rows)
+    (STATS_FIXED + usize::from(rows > 0) + rows, rows)
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -64,10 +74,16 @@ pub fn render(frame: &mut Frame, app: &App) {
         .unwrap_or(false);
     let top_height = if has_storage_line { 5 } else { 4 };
 
+    // Both lists are computed once per frame and passed down. Recomputing them
+    // in each panel would re-filter and re-sort, and would make the two panels
+    // agree only by coincidence rather than by construction.
+    let visible = app.visible_tubes();
+    let timing = app.timing_tubes();
+
     let (bottom_height, timing_rows) = split_bottom(
         area.height.saturating_sub(top_height) as usize,
-        app.visible_tubes().len(),
-        app.timing_tubes().len(),
+        visible.len(),
+        timing.len(),
     );
 
     let chunks = Layout::vertical([
@@ -78,8 +94,8 @@ pub fn render(frame: &mut Frame, app: &App) {
     .split(area);
 
     render_top_bar(frame, app, chunks[0]);
-    render_tube_chart(frame, app, chunks[1]);
-    render_bottom_panel(frame, app, chunks[2], timing_rows);
+    render_tube_chart(frame, app, chunks[1], &visible);
+    render_bottom_panel(frame, app, chunks[2], &timing, timing_rows);
     render_prompt_overlay(frame, app, area);
 }
 
@@ -305,12 +321,15 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(p, area);
 }
 
-fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
+fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeStats]) {
     // Key hints live in the title rather than the legend: the legend is nearly
     // 52 columns of colour swatches on its own and would push them off an
     // 80-column terminal, where they are needed most. Kept tight enough that
     // the whole title still fits in 80 columns with a count present.
-    let hidden = app.hidden_count();
+    //
+    // Derived from the list rather than recounted, so the number can never
+    // disagree with what was actually filtered out.
+    let hidden = app.tube_count().saturating_sub(tubes.len());
     let sort = app.sort.label();
     // The label says what the key will do next, not what state we are in.
     let toggle = if app.hide_empty {
@@ -326,8 +345,6 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
     let title =
         format!(" Tubes ({scope}) \u{2191}\u{2193} p:pause u:unpause s:sort {toggle} q:quit ");
     let block = Block::default().borders(Borders::BOTTOM).title(title);
-
-    let tubes = app.visible_tubes();
 
     if app.current.is_none() {
         frame.render_widget(block, area);
@@ -363,7 +380,7 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
     // Scroll the window just far enough to keep the cursor on screen. Derived
     // from the selection rather than stored, so it cannot drift out of sync
     // with a list that is refiltered and resorted on every poll.
-    let selected = app.selected_index();
+    let selected = app.index_of_selected(tubes);
     let offset = match selected {
         Some(i) if chart_height > 0 && i >= chart_height => i + 1 - chart_height,
         _ => 0,
@@ -383,140 +400,48 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(CURSOR_WIDTH + max_name_len as u16 + 2 + 8 + 12 + pause_reserve)
         as usize;
 
+    // A row is cursor + name + bar + total + chevron + ewma + badge. Only the
+    // bar differs between an empty tube and a busy one, so only the bar
+    // branches — everything after it is written once.
     let mut lines = Vec::new();
     for (row, tube) in tubes.iter().enumerate().skip(offset).take(chart_height) {
         let is_selected = selected == Some(row);
-        let cursor = Span::styled(
-            if is_selected { "\u{258c}" } else { " " },
-            Style::default().fg(Color::Cyan),
-        );
-        let name_style = if is_selected {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let padded_name = format!("{:>width$} ", truncate_name(&tube.name, max_name_len), width = max_name_len);
-
-        let urgent = tube.current_jobs_urgent;
-        let ready = tube.current_jobs_ready.saturating_sub(urgent);
-        let reserved = tube.current_jobs_reserved;
-        let delayed = tube.current_jobs_delayed;
-        let buried = tube.current_jobs_buried;
         let total = tube.current_total();
 
-        let total_display = format!(" {:>7}", format_number(total));
-
-        if total == 0 {
-            let mut spans = vec![
-                cursor,
-                Span::styled(padded_name, name_style),
-                Span::styled(
-                    "·".repeat(bar_width.min(3)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ];
-            spans.push(Span::styled(total_display, Style::default().fg(Color::DarkGray)));
-            if let Some(prev_total) = app.previous_tube_total(&tube.name) {
-                let (chevron, color) = queue_change_indicator(prev_total, total);
-                spans.push(Span::styled(format!(" {chevron}"), Style::default().fg(color)));
-            }
-            if let Some(badge) = pause_badge(tube) {
-                spans.push(badge);
-            }
-            lines.push(Line::from(spans));
-            continue;
-        }
-
-        // Build per-status data: (count, label, fg_color, bg_color)
-        let orange = Color::Rgb(255, 165, 0);
-        let statuses: [(u64, Color, Color); 5] = [
-            (ready, Color::Black, Color::Green),
-            (urgent, Color::Black, orange),
-            (reserved, Color::Black, Color::Yellow),
-            (delayed, Color::White, Color::Blue),
-            (buried, Color::White, Color::Red),
+        let mut spans = vec![
+            Span::styled(
+                if is_selected { "\u{258c}" } else { " " },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("{:>width$} ", truncate_name(&tube.name, max_name_len), width = max_name_len),
+                if is_selected {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
         ];
 
-        // For each non-zero status, compute label and minimum width
-        let mut segments: Vec<(String, usize, Color, Color)> = Vec::new();
-        let mut log_values: Vec<f64> = Vec::new();
-        for &(count, fg, bg) in &statuses {
-            if count > 0 {
-                let label = format_number(count);
-                let min_w = label.len();
-                segments.push((label, min_w, fg, bg));
-                log_values.push((count as f64 + 1.0).log10());
-            }
-        }
+        spans.extend(bar_spans(tube, bar_width));
 
-        // Allocate widths: each segment gets at least min_width, remaining space distributed by log10
-        let total_min: usize = segments.iter().map(|(_, mw, _, _)| *mw).sum();
-        let mut widths: Vec<usize> = segments.iter().map(|(_, mw, _, _)| *mw).collect();
+        let total_display = format!(" {:>7}", format_number(total));
+        spans.push(if total == 0 {
+            Span::styled(total_display, Style::default().fg(Color::DarkGray))
+        } else {
+            Span::raw(total_display)
+        });
 
-        if bar_width > total_min {
-            let remaining = bar_width - total_min;
-            let log_total: f64 = log_values.iter().sum();
-            if log_total > 0.0 {
-                let scale = remaining as f64 / log_total;
-                let mut distributed = 0usize;
-                for (i, lv) in log_values.iter().enumerate() {
-                    if i < widths.len() - 1 {
-                        let extra = (lv * scale).round() as usize;
-                        widths[i] += extra;
-                        distributed += extra;
-                    }
-                }
-                // Give remainder to last segment
-                if let Some(last) = widths.last_mut() {
-                    *last += remaining.saturating_sub(distributed);
-                }
-            }
-        } else if bar_width < total_min && !segments.is_empty() {
-            // Truncate proportionally but ensure at least 1 char per segment
-            let scale = bar_width as f64 / total_min as f64;
-            let mut used = 0usize;
-            for (i, w) in widths.iter_mut().enumerate() {
-                if i < segments.len() - 1 {
-                    *w = (*w as f64 * scale).round().max(1.0) as usize;
-                    used += *w;
-                }
-            }
-            if let Some(last) = widths.last_mut() {
-                *last = bar_width.saturating_sub(used).max(1);
-            }
-        }
-
-        let mut spans = vec![cursor, Span::styled(padded_name, name_style)];
-
-        for (i, (label, _min_w, fg, bg)) in segments.iter().enumerate() {
-            let w = widths[i];
-            let text = if w >= label.len() {
-                let pad_total = w - label.len();
-                let pad_left = pad_total / 2;
-                let pad_right = pad_total - pad_left;
-                format!("{}{}{}", " ".repeat(pad_left), label, " ".repeat(pad_right))
-            } else {
-                // Segment too narrow for full label, show what fits
-                label[..w].to_string()
-            };
-            spans.push(Span::styled(
-                text,
-                Style::default().fg(*fg).bg(*bg),
-            ));
-        }
-
-        spans.push(Span::raw(total_display));
-
-        // Queue growth indicator
+        // Queue growth indicator. queue_change_indicator yields a glyph on
+        // every arm, so this needs no emptiness guard.
         if let Some(prev_total) = app.previous_tube_total(&tube.name) {
             let (chevron, color) = queue_change_indicator(prev_total, total);
-            if !chevron.is_empty() {
-                spans.push(Span::styled(format!(" {chevron}"), Style::default().fg(color)));
-            }
+            spans.push(Span::styled(format!(" {chevron}"), Style::default().fg(color)));
         }
 
-        // EWMA if available
-        if tube.processing_time_ewma > 0.0 {
+        // Timing suffix, for tubes actually holding work — an empty tube's row
+        // ends at its total.
+        if total > 0 && tube.processing_time_ewma > 0.0 {
             spans.push(Span::styled(
                 format!(" ({})", format_duration(tube.processing_time_ewma)),
                 Style::default().fg(Color::DarkGray),
@@ -562,11 +487,98 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![Line::from(legend)]), legend_area);
 }
 
-/// Width of the selection cursor column.
-const CURSOR_WIDTH: u16 = 1;
+/// The body of a tube's bar: log-scaled coloured segments per job state, or a
+/// dotted placeholder when the tube holds nothing. This is the only part of a
+/// chart row that differs between an empty tube and a busy one.
+fn bar_spans(tube: &TubeStats, bar_width: usize) -> Vec<Span<'static>> {
+    if tube.current_total() == 0 {
+        return vec![Span::styled(
+            "·".repeat(bar_width.min(3)),
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+
+    // Build per-status data: (count, fg_color, bg_color)
+    let orange = Color::Rgb(255, 165, 0);
+    let urgent = tube.current_jobs_urgent;
+    let statuses: [(u64, Color, Color); 5] = [
+        (tube.current_jobs_ready.saturating_sub(urgent), Color::Black, Color::Green),
+        (urgent, Color::Black, orange),
+        (tube.current_jobs_reserved, Color::Black, Color::Yellow),
+        (tube.current_jobs_delayed, Color::White, Color::Blue),
+        (tube.current_jobs_buried, Color::White, Color::Red),
+    ];
+
+    // For each non-zero status, compute label and minimum width
+    let mut segments: Vec<(String, usize, Color, Color)> = Vec::new();
+    let mut log_values: Vec<f64> = Vec::new();
+    for &(count, fg, bg) in &statuses {
+        if count > 0 {
+            let label = format_number(count);
+            let min_w = label.len();
+            segments.push((label, min_w, fg, bg));
+            log_values.push((count as f64 + 1.0).log10());
+        }
+    }
+
+    // Allocate widths: each segment gets at least min_width, remaining space distributed by log10
+    let total_min: usize = segments.iter().map(|(_, mw, _, _)| *mw).sum();
+    let mut widths: Vec<usize> = segments.iter().map(|(_, mw, _, _)| *mw).collect();
+
+    if bar_width > total_min {
+        let remaining = bar_width - total_min;
+        let log_total: f64 = log_values.iter().sum();
+        if log_total > 0.0 {
+            let scale = remaining as f64 / log_total;
+            let mut distributed = 0usize;
+            for (i, lv) in log_values.iter().enumerate() {
+                if i < widths.len() - 1 {
+                    let extra = (lv * scale).round() as usize;
+                    widths[i] += extra;
+                    distributed += extra;
+                }
+            }
+            // Give remainder to last segment
+            if let Some(last) = widths.last_mut() {
+                *last += remaining.saturating_sub(distributed);
+            }
+        }
+    } else if bar_width < total_min && !segments.is_empty() {
+        // Truncate proportionally but ensure at least 1 char per segment
+        let scale = bar_width as f64 / total_min as f64;
+        let mut used = 0usize;
+        for (i, w) in widths.iter_mut().enumerate() {
+            if i < segments.len() - 1 {
+                *w = (*w as f64 * scale).round().max(1.0) as usize;
+                used += *w;
+            }
+        }
+        if let Some(last) = widths.last_mut() {
+            *last = bar_width.saturating_sub(used).max(1);
+        }
+    }
+
+    segments
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _min_w, fg, bg))| {
+            let w = widths[i];
+            let text = if w >= label.len() {
+                let pad_total = w - label.len();
+                let pad_left = pad_total / 2;
+                let pad_right = pad_total - pad_left;
+                format!("{}{}{}", " ".repeat(pad_left), label, " ".repeat(pad_right))
+            } else {
+                // Segment too narrow for full label, show what fits
+                label[..w].to_string()
+            };
+            Span::styled(text, Style::default().fg(*fg).bg(*bg))
+        })
+        .collect()
+}
 
 /// `PAUSED 12m` for a tube whose pause has not yet elapsed.
-fn pause_badge(tube: &tuber_lib::model::TubeStats) -> Option<Span<'static>> {
+fn pause_badge(tube: &TubeStats) -> Option<Span<'static>> {
     if !tube.is_paused() {
         return None;
     }
@@ -576,7 +588,13 @@ fn pause_badge(tube: &tuber_lib::model::TubeStats) -> Option<Span<'static>> {
     ))
 }
 
-fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect, timing_rows: usize) {
+fn render_bottom_panel(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    all_timing: &[&TubeStats],
+    timing_rows: usize,
+) {
     let block = Block::default().borders(Borders::TOP).title(" Stats ");
 
     let Some(snap) = &app.current else {
@@ -597,20 +615,19 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect, timing_rows: us
         Span::styled(")", Style::default().fg(Color::DarkGray)),
     ]);
 
-    let total_buried: u64 = snap.tubes.iter().map(|t| t.current_jobs_buried).sum();
-    let paused_count = snap.tubes.iter().filter(|t| t.is_paused()).count();
+    let (total_buried, paused_count) = snap.tubes.iter().fold((0u64, 0usize), |(b, p), t| {
+        (b + t.current_jobs_buried, p + usize::from(t.is_paused()))
+    });
 
-    // Sorted to match the chart, so a tube sits at a comparable position in
-    // both panels, and trimmed to the row budget the layout allowed us.
-    let all_timing = app.timing_tubes();
+    // Trimmed to the row budget the layout allowed us, giving up a row to the
+    // "+N more" marker when we cannot show everything.
     let truncated = all_timing.len() > timing_rows;
-    // Give up a row to the "+N more" marker when we cannot show everything.
     let shown = if truncated {
         timing_rows.saturating_sub(1)
     } else {
-        timing_rows
+        all_timing.len()
     };
-    let timing_tubes = &all_timing[..shown.min(all_timing.len())];
+    let timing_tubes = &all_timing[..shown];
     let max_name_len = timing_tubes
         .iter()
         .map(|t| t.name.len())
@@ -634,7 +651,7 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect, timing_rows: us
     if paused_count > 0 {
         line2_spans.push(Span::styled("  Paused: ", Style::default().fg(Color::DarkGray)));
         line2_spans.push(Span::styled(
-            format!("{paused_count} tube{}", if paused_count == 1 { "" } else { "s" }),
+            format!("{paused_count} tube{}", plural(paused_count)),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
@@ -648,7 +665,7 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect, timing_rows: us
             format!(
                 " {} tube{} with recent activity have timing data \u{2014} resize taller to show",
                 all_timing.len(),
-                if all_timing.len() == 1 { "" } else { "s" }
+                plural(all_timing.len())
             ),
             Style::default().fg(Color::DarkGray),
         )));
@@ -732,8 +749,6 @@ fn render_bottom_panel(frame: &mut Frame, app: &App, area: Rect, timing_rows: us
     frame.render_widget(p, area);
 }
 
-
-
 fn format_uptime(seconds: u64) -> String {
     let days = seconds / 86400;
     let hours = (seconds % 86400) / 3600;
@@ -810,6 +825,11 @@ fn format_number(n: u64) -> String {
     }
 }
 
+/// Pluralising suffix for a count.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,6 +881,35 @@ mod tests {
             }
             // The panel must always have room for the rows it claims.
             assert!(bottom >= STATS_FIXED + usize::from(rows > 0) + rows || rows == 0);
+        }
+    }
+
+    #[test]
+    fn a_claimed_row_always_renders_a_tube() {
+        // render_bottom_panel gives a row up to the "+N more" marker when it
+        // cannot show everything, so returning rows=1 with more to show would
+        // reserve panel height and then render no timing rows at all — and no
+        // note either, since that is gated on rows == 0.
+        for avail in 0..200 {
+            for visible in 0..60 {
+                for timing in 0..60 {
+                    let (height, rows) = split_bottom(avail, visible, timing);
+                    if rows == 0 {
+                        continue;
+                    }
+                    let truncated = timing > rows;
+                    let shown = if truncated { rows - 1 } else { timing };
+                    assert!(
+                        shown > 0,
+                        "avail={avail} visible={visible} timing={timing} -> rows={rows} \
+                         reserves height {height} but renders no timing rows"
+                    );
+                    assert!(
+                        height >= STATS_FIXED + 1 + rows,
+                        "avail={avail} timing={timing} -> height {height} too small for {rows} rows"
+                    );
+                }
+            }
         }
     }
 

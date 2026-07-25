@@ -43,9 +43,8 @@ enum Action {
 fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     // The prompt swallows everything, including `q` — otherwise typing a
     // duration could quit the app.
-    if let Mode::PausePrompt { tube, buf } = &app.mode {
-        let (tube, buf) = (tube.clone(), buf.clone());
-        return handle_prompt_key(app, key, tube, buf);
+    if matches!(app.mode, Mode::PausePrompt { .. }) {
+        return handle_prompt_key(&mut app.mode, key);
     }
 
     match key.code {
@@ -93,15 +92,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     }
 }
 
-fn handle_prompt_key(app: &mut App, key: KeyEvent, tube: String, buf: String) -> Action {
+/// Takes the mode by reference and destructures once, so the buffer being read
+/// on Enter is the same one the character keys wrote to.
+fn handle_prompt_key(mode: &mut Mode, key: KeyEvent) -> Action {
+    let Mode::PausePrompt { tube, buf } = mode else {
+        return Action::None;
+    };
     match key.code {
         KeyCode::Esc => {
-            app.mode = Mode::Normal;
+            *mode = Mode::Normal;
             Action::None
         }
-        KeyCode::Enter => match parse_duration(&buf) {
+        KeyCode::Enter => match parse_duration(buf) {
             Some(delay) => {
-                app.mode = Mode::Normal;
+                let tube = tube.clone();
+                *mode = Mode::Normal;
                 Action::Pause { tube, delay }
             }
             // No status message: it would linger after Esc, and the prompt
@@ -109,17 +114,11 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, tube: String, buf: String) ->
             None => Action::None,
         },
         KeyCode::Backspace => {
-            if let Mode::PausePrompt { buf, .. } = &mut app.mode {
-                buf.pop();
-            }
+            buf.pop();
             Action::None
         }
-        KeyCode::Char(c) => {
-            if let Mode::PausePrompt { buf, .. } = &mut app.mode {
-                if buf.len() < 8 {
-                    buf.push(c);
-                }
-            }
+        KeyCode::Char(c) if buf.len() < 8 => {
+            buf.push(c);
             Action::None
         }
         _ => Action::None,
@@ -141,25 +140,19 @@ fn spawn_pause(addr: String, tube: String, delay: u32, tx: mpsc::Sender<PollMsg>
         }
         .await;
 
-        let msg = match &result {
-            Ok(_) if delay == 0 => PollMsg::Status {
-                msg: format!("{tube} unpaused"),
-                error: false,
-            },
-            Ok(_) => PollMsg::Status {
-                msg: format!("{tube} paused for {}", format_secs(delay as u64)),
-                error: false,
-            },
-            Err(e) => PollMsg::Status {
-                msg: format!("{tube}: {e}"),
-                error: true,
-            },
+        let (msg, error) = match result {
+            Ok(snap) => {
+                let _ = tx.send(PollMsg::Snapshot(Box::new(snap))).await;
+                let what = if delay == 0 {
+                    "unpaused".to_string()
+                } else {
+                    format!("paused for {}", format_secs(delay as u64))
+                };
+                (format!("{tube} {what}"), false)
+            }
+            Err(e) => (format!("{tube}: {e}"), true),
         };
-
-        if let Ok(snap) = result {
-            let _ = tx.send(PollMsg::Snapshot(Box::new(snap))).await;
-        }
-        let _ = tx.send(msg).await;
+        let _ = tx.send(PollMsg::Status { msg, error }).await;
     });
 }
 
@@ -223,8 +216,11 @@ async fn main() -> anyhow::Result<()> {
                 terminal.draw(|f| ui::render(f, &app))?;
             }
             Some(Ok(event)) = event_stream.next() => {
-                if let Event::Key(key) = event {
-                    if key.kind == KeyEventKind::Press {
+                // Only redraw for events that can change the frame. Key release
+                // and repeat events arrive on some terminals and would
+                // otherwise cost a full render each.
+                let redraw = match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         match handle_key(&mut app, key) {
                             Action::Quit => break,
                             Action::Pause { tube, delay } => {
@@ -232,9 +228,16 @@ async fn main() -> anyhow::Result<()> {
                             }
                             Action::None => {}
                         }
+                        true
                     }
+                    // The chart/stats split is derived from the frame height,
+                    // so a resize must re-render.
+                    Event::Resize(_, _) => true,
+                    _ => false,
+                };
+                if redraw {
+                    terminal.draw(|f| ui::render(f, &app))?;
                 }
-                terminal.draw(|f| ui::render(f, &app))?;
             }
         }
     }
