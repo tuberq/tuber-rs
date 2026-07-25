@@ -11,6 +11,9 @@ pub struct ServerStats {
     pub current_producers: u64,
     pub current_workers: u64,
     pub current_waiting: u64,
+    /// A subset of `current_jobs_ready`, not a state of its own — the same
+    /// relationship the per-tube counts have.
+    pub current_jobs_urgent: u64,
     pub current_jobs_ready: u64,
     pub current_jobs_reserved: u64,
     pub current_jobs_delayed: u64,
@@ -60,6 +63,7 @@ impl ServerStats {
             current_producers: get_u64(&m, "current-producers"),
             current_workers: get_u64(&m, "current-workers"),
             current_waiting: get_u64(&m, "current-waiting"),
+            current_jobs_urgent: get_u64(&m, "current-jobs-urgent"),
             current_jobs_ready: get_u64(&m, "current-jobs-ready"),
             current_jobs_reserved: get_u64(&m, "current-jobs-reserved"),
             current_jobs_delayed: get_u64(&m, "current-jobs-delayed"),
