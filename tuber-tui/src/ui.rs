@@ -2,13 +2,13 @@ use crate::app::{
     format_secs, kick_plan, kick_target, parse_count, parse_duration, App, Mode, PromptKind,
 };
 use tuber_lib::model::TubeStats;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-/// Chart rows consumed by its own chrome: bottom border + legend line.
+/// Chart rows consumed by its own chrome: bottom border + column header line.
 const CHART_OVERHEAD: usize = 2;
 /// Tube rows the chart keeps even when the timing table wants more space.
 const CHART_MIN_ROWS: usize = 4;
@@ -21,6 +21,56 @@ const STATS_FIXED: usize = 5;
 const CHART_MAX_SHARE: (usize, usize) = (2, 3);
 /// Width of the selection cursor column.
 const CURSOR_WIDTH: u16 = 1;
+/// Space between the blocks of a chart row.
+const GAP: usize = 2;
+/// Width of one job-state count column. `format_number` never needs more than
+/// six columns, and the widest state header ("buried") is six as well.
+const COUNT_WIDTH: usize = 6;
+/// Width of the total column, and of the trend chevron that qualifies it —
+/// reserved even on the first poll, when there is no previous total to compare
+/// against, so the columns after it do not shift once one arrives.
+const TOTAL_WIDTH: usize = 7;
+const TREND_WIDTH: usize = 2;
+/// Width of the trailing `(  2.4s)` timing suffix.
+const EWMA_WIDTH: usize = 9;
+/// Bounds on the size bar. The cap is deliberately well short of the terminal
+/// width: the counts carry the precision, so the bar only has to say roughly how
+/// big and roughly what mix, and twenty cells over six decades of jobs says that
+/// clearly. Letting it stretch would spread a row back across the screen, which
+/// is the sprawl this layout exists to undo. Below the floor it cannot show a
+/// proportion at all, and the width goes to the counts instead.
+const BAR_MAX: usize = 20;
+const BAR_MIN: usize = 6;
+/// Shortest the name column is allowed to get before the row simply overflows.
+/// Below this a truncated name identifies nothing, so there is no point trading
+/// further width for it.
+const NAME_MIN: usize = 6;
+
+/// The job states a tube reports, in bar order: header label and colour. The
+/// colour is used for the header, the count and the bar fill, which is what
+/// lets the header line double as the legend.
+const STATES: [(&str, Color); 5] = [
+    ("ready", Color::Green),
+    ("urgnt", Color::Rgb(255, 165, 0)),
+    ("resvd", Color::Yellow),
+    ("delay", Color::Blue),
+    ("buried", Color::Red),
+];
+
+/// A tube's counts, indexed to match [`STATES`].
+///
+/// Ready is net of urgent: `current-jobs-urgent` is a subset of
+/// `current-jobs-ready`, so the two columns would otherwise double-count it and
+/// stop summing to the total.
+fn state_counts(tube: &TubeStats) -> [u64; 5] {
+    [
+        tube.current_jobs_ready.saturating_sub(tube.current_jobs_urgent),
+        tube.current_jobs_urgent,
+        tube.current_jobs_reserved,
+        tube.current_jobs_delayed,
+        tube.current_jobs_buried,
+    ]
+}
 
 /// Split the space below the top bar between the tube chart and the timing
 /// table. The chart is the primary widget and is served first; the timing
@@ -376,9 +426,10 @@ fn chart_title(scope: &str, toggle: &str, width: u16) -> String {
 }
 
 fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeStats]) {
-    // Key hints live in the title rather than the legend: the legend is nearly
-    // 52 columns of colour swatches on its own and would push them off an
-    // 80-column terminal, where they are needed most.
+    // Key hints live in the title, which leaves the header line free to carry
+    // the column labels. Those are drawn in their state colours, so they are
+    // the legend as well — the swatch legend this replaced spent a whole row on
+    // 52 columns saying only what the headers now say in passing.
     //
     // Derived from the list rather than recounted, so the number can never
     // disagree with what was actually filtered out.
@@ -418,15 +469,16 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Reserve last line for legend
-    let chart_height = inner.height.saturating_sub(1) as usize;
-    let chart_area = Rect {
-        height: chart_height as u16,
+    // Reserve the first line for the column headers.
+    let header_height = inner.height.min(1);
+    let chart_height = inner.height.saturating_sub(header_height) as usize;
+    let header_area = Rect {
+        height: header_height,
         ..inner
     };
-    let legend_area = Rect {
-        y: inner.y + chart_height as u16,
-        height: 1,
+    let chart_area = Rect {
+        y: inner.y + header_height,
+        height: chart_height as u16,
         ..inner
     };
 
@@ -446,20 +498,28 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
     // so the common case keeps its full bar width.
     let pause_reserve = if tubes.iter().any(|t| t.is_paused()) { 12 } else { 0 };
 
-    // Available width for bars: cursor + name + space + total + ewma suffix.
-    // Reserve 12 extra chars for the " (12.3ms)" suffix and padding.
-    let bar_width = inner
-        .width
-        .saturating_sub(CURSOR_WIDTH + max_name_len as u16 + 2 + 8 + 12 + pause_reserve)
-        as usize;
+    // A state earns a column only when some visible tube has jobs in it.
+    // Decided once for the whole frame rather than per row, which is the point:
+    // every row keeps the same columns, so the numbers line up and a column's
+    // position identifies its state — while a state nobody is using spends no
+    // width at all.
+    let columns = active_columns(tubes);
+    let (name_width, bar_width, show_ewma) = row_widths(
+        inner.width as usize,
+        max_name_len,
+        column_block_width(&columns),
+        pause_reserve,
+    );
 
-    // A row is cursor + name + bar + total + chevron + ewma + badge. Only the
-    // bar differs between an empty tube and a busy one, so only the bar
-    // branches — everything after it is written once.
+    // The busiest visible tube sets the bar scale, so bar lengths are
+    // comparable down the column.
+    let max_total = tubes.iter().map(|t| t.current_total()).max().unwrap_or(0);
+
     let mut lines = Vec::new();
     for (row, tube) in tubes.iter().enumerate().skip(offset).take(chart_height) {
         let is_selected = selected == Some(row);
         let total = tube.current_total();
+        let counts = state_counts(tube);
 
         let mut spans = vec![
             Span::styled(
@@ -467,7 +527,7 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
-                format!("{:>width$} ", truncate_name(&tube.name, max_name_len), width = max_name_len),
+                format!("{:>width$}", truncate_name(&tube.name, name_width), width = name_width),
                 if is_selected {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
@@ -476,25 +536,48 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
             ),
         ];
 
-        spans.extend(bar_spans(tube, bar_width));
-
-        let total_display = format!(" {:>7}", format_number(total));
+        // Total leads the breakdown, so the row reads whole-then-parts: "908
+        // total, made of 5 ready, 10 delayed, 893 buried".
+        let total_display = format!("{:>width$}", format_number(total), width = GAP + TOTAL_WIDTH);
         spans.push(if total == 0 {
             Span::styled(total_display, Style::default().fg(Color::DarkGray))
         } else {
             Span::raw(total_display)
         });
 
-        // Queue growth indicator. queue_change_indicator yields a glyph on
-        // every arm, so this needs no emptiness guard.
-        if let Some(prev_total) = app.previous_tube_total(&tube.name) {
-            let (chevron, color) = queue_change_indicator(prev_total, total);
-            spans.push(Span::styled(format!(" {chevron}"), Style::default().fg(color)));
+        // Growth chevron, qualifying the total it follows. queue_change_indicator
+        // yields a glyph on every arm, so this needs no emptiness guard — but
+        // the width is held even before there is a previous total to compare.
+        match app.previous_tube_total(&tube.name) {
+            Some(prev_total) => {
+                let (chevron, color) = queue_change_indicator(prev_total, total);
+                spans.push(Span::styled(format!(" {chevron}"), Style::default().fg(color)));
+            }
+            None => spans.push(Span::raw(" ".repeat(TREND_WIDTH))),
+        }
+
+        // Each count carries its state's colour, so the number is its own key.
+        // A state holding nothing gets a dim placeholder rather than a zero: the
+        // column has to keep its place, but a screenful of zeros reads as data.
+        for (n, &state) in columns.iter().enumerate() {
+            let (text, color) = match counts[state] {
+                0 => ("\u{00b7}".to_string(), Color::DarkGray),
+                count => (format_number(count), STATES[state].1),
+            };
+            spans.push(Span::styled(
+                format!("{:>width$}", text, width = count_field_width(n)),
+                Style::default().fg(color),
+            ));
+        }
+
+        if bar_width > 0 {
+            spans.push(Span::raw(" ".repeat(GAP)));
+            spans.extend(size_bar_spans(&counts, total, max_total, bar_width));
         }
 
         // Timing suffix, for tubes actually holding work — an empty tube's row
-        // ends at its total.
-        if total > 0 && tube.processing_time_ewma > 0.0 {
+        // ends at its bar.
+        if show_ewma && total > 0 && tube.processing_time_ewma > 0.0 {
             spans.push(Span::styled(
                 format!(" ({})", format_duration(tube.processing_time_ewma)),
                 Style::default().fg(Color::DarkGray),
@@ -511,123 +594,179 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
     let chart = Paragraph::new(lines);
     frame.render_widget(chart, chart_area);
 
-    let mut legend = vec![
-        Span::styled(" █", Style::default().fg(Color::Green)),
-        Span::raw(" Ready  "),
-        Span::styled("█", Style::default().fg(Color::Rgb(255, 165, 0))),
-        Span::raw(" Urgent  "),
-        Span::styled("█", Style::default().fg(Color::Yellow)),
-        Span::raw(" Reserved  "),
-        Span::styled("█", Style::default().fg(Color::Blue)),
-        Span::raw(" Delayed  "),
-        Span::styled("█", Style::default().fg(Color::Red)),
-        Span::raw(" Buried"),
+    let mut header = vec![
+        Span::raw(" ".repeat(CURSOR_WIDTH as usize + name_width)),
+        Span::styled(
+            format!("{:>width$}", "total", width = GAP + TOTAL_WIDTH),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" ".repeat(TREND_WIDTH)),
     ];
+    for (n, &state) in columns.iter().enumerate() {
+        header.push(Span::styled(
+            format!("{:>width$}", STATES[state].0, width = count_field_width(n)),
+            Style::default().fg(STATES[state].1),
+        ));
+    }
+    if bar_width > 0 {
+        header.push(Span::styled(
+            format!("{}{:<bar$}", " ".repeat(GAP), "size", bar = bar_width),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(vec![Line::from(header)]), header_area);
 
-    // Scroll position, when the list does not all fit.
+    // Scroll position, when the list does not all fit. Right-aligned over the
+    // header rather than inline, so it cannot push the column labels out of
+    // line with the rows beneath them.
     if tubes.len() > chart_height {
-        legend.push(Span::styled(
+        let pos = Span::styled(
             format!(
-                "  [{}-{} of {}]",
+                "[{}-{} of {}] ",
                 offset + 1,
                 (offset + chart_height).min(tubes.len()),
                 tubes.len()
             ),
             Style::default().fg(Color::DarkGray),
-        ));
+        );
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(pos)]).alignment(Alignment::Right),
+            header_area,
+        );
     }
-
-    frame.render_widget(Paragraph::new(vec![Line::from(legend)]), legend_area);
 }
 
-/// The body of a tube's bar: log-scaled coloured segments per job state, or a
-/// dotted placeholder when the tube holds nothing. This is the only part of a
-/// chart row that differs between an empty tube and a busy one.
-fn bar_spans(tube: &TubeStats, bar_width: usize) -> Vec<Span<'static>> {
-    if tube.current_total() == 0 {
-        return vec![Span::styled(
-            "·".repeat(bar_width.min(3)),
-            Style::default().fg(Color::DarkGray),
-        )];
+/// Divide a row's width between the parts that can give way, returning
+/// `(name_width, bar_width, show_ewma)`.
+///
+/// The total and the count columns are never traded away: they are the only
+/// numbers on the row that appear nowhere else on the screen, and clipping them
+/// would take `buried` — the one that matters most — off the right edge first,
+/// because it sits at the end of the block. So the bar goes, then the timing
+/// suffix (which the Stats panel repeats in more detail anyway), and the name
+/// truncates before either of those is allowed to push the counts off.
+fn row_widths(
+    width: usize,
+    max_name_len: usize,
+    counts_width: usize,
+    pause_reserve: usize,
+) -> (usize, usize, bool) {
+    let core = CURSOR_WIDTH as usize + GAP + TOTAL_WIDTH + TREND_WIDTH + counts_width + pause_reserve;
+
+    // The name identifies the row, so it is served first — but it shrinks to
+    // whatever is left rather than holding its full width at the counts' expense.
+    let name_width = width
+        .saturating_sub(core)
+        .clamp(NAME_MIN.min(max_name_len), max_name_len);
+
+    // The bar claims only its floor at first, so that on a terminal with room
+    // for one or the other the timing suffix is not starved by a bar that had
+    // already grown to its cap. Once both are placed, the bar absorbs the slack.
+    let mut spare = width.saturating_sub(core + name_width);
+    let mut bar_width = if spare >= GAP + BAR_MIN { BAR_MIN } else { 0 };
+    if bar_width > 0 {
+        spare -= GAP + bar_width;
+    }
+    let show_ewma = spare >= EWMA_WIDTH;
+    if show_ewma {
+        spare -= EWMA_WIDTH;
+    }
+    if bar_width > 0 {
+        bar_width = (bar_width + spare).min(BAR_MAX);
+    }
+    (name_width, bar_width, show_ewma)
+}
+
+/// Indices into [`STATES`] that any of `tubes` has jobs in.
+fn active_columns(tubes: &[&TubeStats]) -> Vec<usize> {
+    (0..STATES.len())
+        .filter(|&i| tubes.iter().any(|t| state_counts(t)[i] > 0))
+        .collect()
+}
+
+/// Width of the `n`th count field, gap included. The first field carries the
+/// full gap that separates it from the trend chevron; the rest sit one column
+/// apart. Header and row use this same function, which is what keeps them
+/// aligned.
+fn count_field_width(n: usize) -> usize {
+    COUNT_WIDTH + if n == 0 { GAP } else { 1 }
+}
+
+/// Total width of the count block, gaps included.
+fn column_block_width(columns: &[usize]) -> usize {
+    (0..columns.len()).map(count_field_width).sum()
+}
+
+/// How much of a `width`-cell bar a tube fills, and how those cells divide
+/// between its states.
+///
+/// Length is the tube's total on a log scale against the busiest visible tube,
+/// so lengths are comparable down the column. The fill is split *linearly*,
+/// because within one row the question is what share each state holds, and a log
+/// split would answer a different one.
+///
+/// The bar this replaced filled the full width on every row and log-scaled the
+/// segments within it, which made a tube holding one job look as busy as one
+/// holding a million, and a handful of buried jobs look like a third of the
+/// queue.
+fn bar_cells(counts: &[u64; 5], total: u64, max_total: u64, width: usize) -> ([usize; 5], usize) {
+    let mut cells = [0usize; 5];
+    if total == 0 || max_total == 0 || width == 0 {
+        return (cells, 0);
     }
 
-    // Build per-status data: (count, fg_color, bg_color)
-    let orange = Color::Rgb(255, 165, 0);
-    let urgent = tube.current_jobs_urgent;
-    let statuses: [(u64, Color, Color); 5] = [
-        (tube.current_jobs_ready.saturating_sub(urgent), Color::Black, Color::Green),
-        (urgent, Color::Black, orange),
-        (tube.current_jobs_reserved, Color::Black, Color::Yellow),
-        (tube.current_jobs_delayed, Color::White, Color::Blue),
-        (tube.current_jobs_buried, Color::White, Color::Red),
-    ];
+    // A tube with jobs always gets at least one cell — rounding it away would
+    // render it identical to an empty tube.
+    let scale = (total as f64 + 1.0).log10() / (max_total as f64 + 1.0).log10();
+    let filled = ((scale * width as f64).round() as usize).clamp(1, width);
 
-    // For each non-zero status, compute label and minimum width
-    let mut segments: Vec<(String, usize, Color, Color)> = Vec::new();
-    let mut log_values: Vec<f64> = Vec::new();
-    for &(count, fg, bg) in &statuses {
-        if count > 0 {
-            let label = format_number(count);
-            let min_w = label.len();
-            segments.push((label, min_w, fg, bg));
-            log_values.push((count as f64 + 1.0).log10());
+    // Largest remainder, so the cells add up to `filled` exactly and no state is
+    // rounded up to a cell it has not earned. Deliberately no floor of one cell
+    // per state: that would put back the distortion this bar exists to remove,
+    // and the count columns already name every state that has jobs in it.
+    let mut used = 0usize;
+    let mut remainders: Vec<(f64, usize)> = Vec::new();
+    for (i, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
         }
+        let exact = count as f64 / total as f64 * filled as f64;
+        cells[i] = exact.floor() as usize;
+        used += cells[i];
+        remainders.push((exact.fract(), i));
+    }
+    remainders.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for &(_, i) in remainders.iter().take(filled - used) {
+        cells[i] += 1;
     }
 
-    // Allocate widths: each segment gets at least min_width, remaining space distributed by log10
-    let total_min: usize = segments.iter().map(|(_, mw, _, _)| *mw).sum();
-    let mut widths: Vec<usize> = segments.iter().map(|(_, mw, _, _)| *mw).collect();
+    (cells, filled)
+}
 
-    if bar_width > total_min {
-        let remaining = bar_width - total_min;
-        let log_total: f64 = log_values.iter().sum();
-        if log_total > 0.0 {
-            let scale = remaining as f64 / log_total;
-            let mut distributed = 0usize;
-            for (i, lv) in log_values.iter().enumerate() {
-                if i < widths.len() - 1 {
-                    let extra = (lv * scale).round() as usize;
-                    widths[i] += extra;
-                    distributed += extra;
-                }
-            }
-            // Give remainder to last segment
-            if let Some(last) = widths.last_mut() {
-                *last += remaining.saturating_sub(distributed);
-            }
-        }
-    } else if bar_width < total_min && !segments.is_empty() {
-        // Truncate proportionally but ensure at least 1 char per segment
-        let scale = bar_width as f64 / total_min as f64;
-        let mut used = 0usize;
-        for (i, w) in widths.iter_mut().enumerate() {
-            if i < segments.len() - 1 {
-                *w = (*w as f64 * scale).round().max(1.0) as usize;
-                used += *w;
-            }
-        }
-        if let Some(last) = widths.last_mut() {
-            *last = bar_width.saturating_sub(used).max(1);
-        }
-    }
-
-    segments
+/// The size bar: coloured fill for the jobs a tube holds, dim track for the rest
+/// of the scale.
+fn size_bar_spans(
+    counts: &[u64; 5],
+    total: u64,
+    max_total: u64,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let (cells, filled) = bar_cells(counts, total, max_total, width);
+    let mut spans: Vec<Span<'static>> = cells
         .iter()
         .enumerate()
-        .map(|(i, (label, _min_w, fg, bg))| {
-            let w = widths[i];
-            let text = if w >= label.len() {
-                let pad_total = w - label.len();
-                let pad_left = pad_total / 2;
-                let pad_right = pad_total - pad_left;
-                format!("{}{}{}", " ".repeat(pad_left), label, " ".repeat(pad_right))
-            } else {
-                // Segment too narrow for full label, show what fits
-                label[..w].to_string()
-            };
-            Span::styled(text, Style::default().fg(*fg).bg(*bg))
+        .filter(|(_, &n)| n > 0)
+        .map(|(i, &n)| {
+            Span::styled("\u{2588}".repeat(n), Style::default().fg(STATES[i].1))
         })
-        .collect()
+        .collect();
+    if filled < width {
+        spans.push(Span::styled(
+            "\u{2591}".repeat(width - filled),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
 }
 
 /// `PAUSED 12m` for a tube whose pause has not yet elapsed.
@@ -827,11 +966,17 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Clip a name to `max_len` display columns.
+///
+/// Truncates on a character boundary, not a byte one. beanstalkd restricts tube
+/// names to ASCII, so this has never mattered — but the name column now shrinks
+/// to fit a narrow terminal rather than always taking its full width, so this
+/// truncates far more often than it used to, and a byte slice through a
+/// multibyte name from a laxer server would panic mid-frame.
 fn truncate_name(name: &str, max_len: usize) -> &str {
-    if name.len() > max_len {
-        &name[..max_len]
-    } else {
-        name
+    match name.char_indices().nth(max_len) {
+        Some((byte, _)) => &name[..byte],
+        None => name,
     }
 }
 
@@ -868,14 +1013,24 @@ fn format_duration(seconds: f64) -> String {
     format!("{:>6}", raw)
 }
 
+/// Never wider than six columns, which is what the count columns are sized to.
+///
+/// Each threshold sits just under its power of ten rather than on it, because
+/// the tier below rounds to one decimal: on a boundary of 1_000_000 the value
+/// 999_999 stays in the K tier and formats as "1000.0K", seven columns wide,
+/// which knocks every column after it out of line.
 fn format_number(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
+    let (divisor, unit) = match n {
+        // Past a thousand trillion jobs the exact figure is noise, and the field
+        // it would need is not worth widening every column for.
+        _ if n >= 999_950_000_000_000 => return ">999T".to_string(),
+        _ if n >= 999_950_000_000 => (1e12, "T"),
+        _ if n >= 999_950_000 => (1e9, "G"),
+        _ if n >= 999_950 => (1e6, "M"),
+        _ if n >= 1_000 => (1e3, "K"),
+        _ => return n.to_string(),
+    };
+    format!("{:.1}{unit}", n as f64 / divisor)
 }
 
 /// Pluralising suffix for a count.
@@ -886,6 +1041,10 @@ fn plural(n: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::time::Instant;
+    use tuber_lib::model::{ServerStats, Snapshot};
 
     /// Rows the chart is left with, given the split.
     fn chart_rows(avail: usize, bottom: usize) -> usize {
@@ -984,6 +1143,278 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The tubes from a real server, as they looked when this layout was
+    /// designed — a wide spread of totals, two states used by only one tube
+    /// each, and a tube whose queue is almost entirely buried.
+    fn sample_tubes() -> Vec<TubeStats> {
+        [
+            ("book", 10_000, 0, 0, 0, 145),
+            ("contributor", 1_700, 0, 0, 3, 511),
+            ("covers", 1_900_000, 135, 0, 0, 184),
+            ("covers-download", 191_300, 207, 0, 14, 463),
+            ("maintenance", 0, 0, 1, 0, 0),
+            ("series", 4, 0, 0, 1, 0),
+            ("work", 5, 0, 0, 10, 893),
+        ]
+        .into_iter()
+        .map(|(name, ready, urgent, reserved, delayed, buried)| {
+            TubeStats::from_yaml(&format!(
+                "name: {name}\n\
+                 current-jobs-ready: {}\n\
+                 current-jobs-urgent: {urgent}\n\
+                 current-jobs-reserved: {reserved}\n\
+                 current-jobs-delayed: {delayed}\n\
+                 current-jobs-buried: {buried}\n\
+                 processing-time-ewma: 2.4\n",
+                ready + urgent,
+            ))
+        })
+        .collect()
+    }
+
+    fn sample_app(tubes: Vec<TubeStats>) -> App {
+        let mut app = App::new();
+        app.update(Snapshot {
+            server: ServerStats::from_yaml("version: tuber 0.13.0\n"),
+            tubes,
+            fetched_at: Instant::now(),
+        });
+        app
+    }
+
+    /// Index of the column header within a rendered chart: line 0 carries the
+    /// block title, which ratatui draws on the top row.
+    const HEADER_LINE: usize = 1;
+
+    /// Render the chart at `width` and give back its lines as plain text.
+    fn draw_chart(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_tube_chart(frame, app, area, &app.visible_tubes());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The whole point of the layout: every row's numbers sit in the same
+    /// columns, so a count can be read down the screen as well as across.
+    #[test]
+    fn counts_line_up_down_the_column() {
+        let app = sample_app(sample_tubes());
+        let lines = draw_chart(&app, 130, 10);
+        for line in &lines {
+            println!("{line}");
+        }
+
+        // Line 0 is the block title; the column header is the first inner row.
+        // Every state is in play here, reserved included — maintenance has one.
+        let header = &lines[HEADER_LINE];
+        for state in ["total", "ready", "urgnt", "resvd", "delay", "buried", "size"] {
+            assert!(header.contains(state), "header {header:?} lacks {state}");
+        }
+
+        // Every state's column ends where its header does, on every row. Indexed
+        // by character rather than byte: the cursor glyph and the `·`
+        // placeholder are multibyte, so byte offsets would not be columns.
+        let rows: Vec<Vec<char>> = lines[HEADER_LINE + 1..HEADER_LINE + 8]
+            .iter()
+            .map(|l| l.chars().collect())
+            .collect();
+        for state in ["ready", "urgnt", "resvd", "delay", "buried"] {
+            // The header is all ASCII, so a byte offset into it is a column.
+            let end = header.find(state).unwrap() + state.len();
+            for row in &rows {
+                let cell: String = row[end - COUNT_WIDTH..end].iter().collect();
+                assert!(
+                    !cell.trim().is_empty(),
+                    "{state} column is blank at {end} on {:?} — a placeholder was expected",
+                    row.iter().collect::<String>()
+                );
+                // Right-aligned means the value ends exactly at the header's
+                // last character, and does not run past it.
+                assert_ne!(
+                    row[end - 1],
+                    ' ',
+                    "{state} column holds {cell:?}, not flush with the header"
+                );
+                assert_eq!(
+                    row[end], ' ',
+                    "{state} column {cell:?} spills past its width on {:?}",
+                    row.iter().collect::<String>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_truncates_on_a_character_boundary() {
+        assert_eq!(truncate_name("covers-download", 6), "covers");
+        assert_eq!(truncate_name("work", 6), "work");
+        assert_eq!(truncate_name("work", 4), "work");
+        // Would panic on a byte slice.
+        assert_eq!(truncate_name("kaffe\u{301}-jobs", 6), "kaffe\u{301}");
+        assert_eq!(truncate_name("\u{4f5c}\u{696d}\u{5217}", 2), "\u{4f5c}\u{696d}");
+    }
+
+    /// A state no visible tube is using spends no width.
+    #[test]
+    fn an_unused_state_gets_no_column() {
+        let quiet: Vec<TubeStats> = sample_tubes()
+            .into_iter()
+            .filter(|t| t.name == "book" || t.name == "series")
+            .collect();
+        let app = sample_app(quiet);
+        let lines = draw_chart(&app, 130, 5);
+        let header = &lines[HEADER_LINE];
+        assert!(header.contains("ready") && header.contains("delay") && header.contains("buried"));
+        assert!(!header.contains("urgnt"), "no tube has urgent jobs: {header:?}");
+        assert!(!header.contains("resvd"), "no tube has reserved jobs: {header:?}");
+    }
+
+    /// On a narrow terminal the bar is what gives way — the counts are the part
+    /// that cannot be inferred from anything else on the row.
+    #[test]
+    fn a_narrow_terminal_drops_the_bar_and_keeps_the_counts() {
+        let app = sample_app(sample_tubes());
+
+        // Nothing ever overflows, at any width — the row is built from fixed
+        // fields plus whatever the bar can have, so this is the check that the
+        // arithmetic adds up.
+        for width in 20..=140u16 {
+            for line in draw_chart(&app, width, 10) {
+                assert!(
+                    line.chars().count() <= width as usize,
+                    "width {width} overflowed: {line:?}"
+                );
+            }
+        }
+
+        // With all five states in play the counts alone need 72 columns, so an
+        // 80-column terminal keeps a six-cell bar and anything narrower spends
+        // the width on the numbers instead.
+        for width in [60u16, 70] {
+            let header = &draw_chart(&app, width, 10)[HEADER_LINE];
+            assert!(!header.contains("size"), "width {width} kept the bar: {header:?}");
+            assert!(header.contains("total"), "width {width} lost the total");
+            assert!(header.contains("buried"), "width {width} lost the counts");
+        }
+        for width in [80u16, 130] {
+            let header = &draw_chart(&app, width, 10)[HEADER_LINE];
+            assert!(header.contains("size"), "width {width} dropped the bar: {header:?}");
+        }
+    }
+
+    /// Header and rows are laid out by the same width functions, so a drift
+    /// between them would be a drift in these.
+    #[test]
+    fn count_block_width_matches_its_fields() {
+        for len in 0..=STATES.len() {
+            let columns: Vec<usize> = (0..len).collect();
+            let summed: usize = (0..len).map(count_field_width).sum();
+            assert_eq!(column_block_width(&columns), summed, "len={len}");
+        }
+        assert_eq!(count_field_width(0), COUNT_WIDTH + GAP, "first field owns the gap");
+        assert_eq!(count_field_width(1), COUNT_WIDTH + 1);
+    }
+
+    #[test]
+    fn bar_cells_always_add_up_to_the_fill() {
+        // The fill is drawn as one span per state plus a track span sized
+        // `width - filled`, so cells that do not sum to `filled` would render a
+        // bar of the wrong length and misalign everything after it.
+        for width in 1..=BAR_MAX {
+            for &total in &[1u64, 5, 908, 10_145, 192_000, 1_900_000] {
+                for &max_total in &[908u64, 10_145, 1_900_000] {
+                    let counts = [total / 2, total / 8, total / 8, total / 8, total / 8];
+                    let sum: u64 = counts.iter().sum();
+                    if sum == 0 {
+                        continue;
+                    }
+                    let (cells, filled) = bar_cells(&counts, sum, max_total, width);
+                    assert_eq!(
+                        cells.iter().sum::<usize>(),
+                        filled,
+                        "width={width} total={sum} max={max_total} cells={cells:?}"
+                    );
+                    assert!(filled <= width, "filled {filled} exceeds width {width}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bar_length_tracks_total() {
+        let max = 1_900_000;
+        let len = |total: u64| {
+            let counts = [total, 0, 0, 0, 0];
+            bar_cells(&counts, total, max, 12).1
+        };
+        // The busiest tube fills the bar; a quiet one gets a stub; nothing at
+        // all gets nothing. This is the whole point of the rewrite — the bar it
+        // replaced was full width on every row.
+        assert_eq!(len(max), 12);
+        assert_eq!(len(0), 0);
+        assert!(len(1) >= 1, "one job must be visible, not rounded away");
+
+        // Monotonic, so a longer bar always means a busier tube.
+        let mut prev = 0;
+        for total in [0u64, 1, 5, 100, 908, 10_145, 192_000, 1_000_000, max] {
+            let n = len(total);
+            assert!(n >= prev, "total={total} drew {n} after {prev}");
+            prev = n;
+        }
+
+        // Strictly longer once the totals are a decade or more apart. Closer
+        // than that they can share a cell — twelve cells over six decades is
+        // half a decade each — which is why the count column carries the number.
+        for (small, big) in [(1, 908), (908, 192_000), (192_000, max)] {
+            assert!(
+                len(small) < len(big),
+                "{small} should draw shorter than {big}"
+            );
+        }
+    }
+
+    #[test]
+    fn fill_does_not_promote_a_negligible_state() {
+        // book from the screenshot: 10.0K ready, 145 buried. Buried is 1.4% of
+        // the tube, so it must not claim a cell of a 12-wide bar — the red count
+        // column is what makes it visible. Rounding it up to one cell would say
+        // 8%, which is the distortion the old bar had.
+        let counts = [10_000, 0, 0, 0, 145];
+        let (cells, filled) = bar_cells(&counts, 10_145, 10_145, 12);
+        assert_eq!(filled, 12);
+        assert_eq!(cells[4], 0, "1.4% must not round up to a cell");
+        assert_eq!(cells[0], 12);
+
+        // A state with a real share does get cells.
+        let work = [5, 0, 0, 10, 893];
+        let (cells, _) = bar_cells(&work, 908, 1_900_000, 12);
+        assert!(cells[4] > 0, "98% buried must dominate the fill: {cells:?}");
+    }
+
+    #[test]
+    fn format_number_fits_a_count_column() {
+        for n in [0u64, 1, 999, 1_000, 999_999, 1_000_000, 999_999_999, u64::MAX] {
+            assert!(
+                format_number(n).len() <= COUNT_WIDTH,
+                "{n} formats to {:?}, wider than a column",
+                format_number(n)
+            );
         }
     }
 
