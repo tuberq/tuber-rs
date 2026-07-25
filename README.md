@@ -186,12 +186,13 @@ paused tube at zero is exactly the one you need to see.
 Every job state has a fixed column, right-aligned and coloured, so a count can
 be read down the screen as well as across — a state holding nothing shows a dim
 `·` rather than closing the gap and shifting the columns after it. The header
-labels are drawn in their state colours, so they double as the legend. A state
-that neither any visible tube nor the server as a whole is using is dropped for
-the whole frame, so alignment never costs width that is not carrying
-information. The `urgnt` column above survives on the server's 988 alone —
-every tube on screen shows a placeholder there, but the jobs exist in tubes the
-filter is hiding, and a state with a total needs a column to put it in.
+labels are drawn in their state colours, so they double as the legend. Every
+state keeps its column whether anything is using it or not: the columns were
+once chosen per frame from what had jobs in it, which held them still down the
+screen but moved them between polls — a tube's last delayed job finishing
+dropped the `delay` column and slid every number after it sideways, on a display
+that repaints every second and a half. Fixed columns that are sometimes empty
+beat columns that move.
 
 The bar sizes each tube against the busiest one on screen, log-scaled, so a tube
 holding one job draws one cell and the lengths are comparable down the column.

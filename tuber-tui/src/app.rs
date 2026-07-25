@@ -74,6 +74,16 @@ impl Selection {
             Selection::Server => None,
         }
     }
+
+    /// What the row is called on screen. Read by both the chart's totals row and
+    /// the detail pane's heading, so the two cannot come to call it different
+    /// things.
+    pub fn label(&self) -> &str {
+        match self {
+            Selection::Tube(name) => name,
+            Selection::Server => "server",
+        }
+    }
 }
 
 pub struct App {
@@ -108,7 +118,7 @@ impl App {
             mode: Mode::Normal,
             // Empty tubes are hidden by default: on a real server most tubes
             // are empty most of the time, and they crowd out the ones doing
-            // work. Paused tubes stay visible even at zero — see is_empty.
+            // work. Paused tubes stay visible even at zero — see pinned.
             hide_empty: true,
             status: None,
         }
@@ -193,9 +203,7 @@ impl App {
     /// cursor movement, so the two cannot disagree — callers should compute
     /// this once per frame and pass the slice down.
     pub fn visible_tubes(&self) -> Vec<&TubeStats> {
-        self.filtered_tubes(|t| {
-            !self.hide_empty || !is_empty(t) || pinned(t) || self.tube_active(t)
-        })
+        self.filtered_tubes(|t| !self.hide_empty || pinned(t) || self.tube_active(t))
     }
 
     /// Holding jobs now, or having moved any since the last poll.
@@ -309,19 +317,10 @@ impl App {
     }
 }
 
-/// Holding no jobs at all. Purely about *contents*, not recent activity: a
-/// tube that drained a moment ago counts as empty. `current_total` covers
-/// buried, so an empty tube cannot be hiding failures.
-///
-/// Distinct from `tube_active`, which is about motion rather than contents.
-fn is_empty(tube: &TubeStats) -> bool {
-    tube.current_total() == 0
-}
-
-/// Reasons a tube stays on screen even when empty tubes are hidden. Kept
-/// separate from `is_empty` so visibility policy can grow without overloading
-/// what "empty" means: a paused tube at zero is exactly what the badge exists
-/// to show.
+/// Reasons a tube stays on screen even when empty tubes are hidden, beyond
+/// holding jobs or having just moved some — which is `tube_active`'s question.
+/// Kept separate so visibility policy can grow without overloading what "empty"
+/// means: a paused tube at zero is exactly what the badge exists to show.
 fn pinned(tube: &TubeStats) -> bool {
     tube.is_paused()
 }
@@ -369,6 +368,12 @@ pub fn kick_plan(bound: u32, available: u64, state: &str) -> String {
         0 => "nothing to kick".to_string(),
         n => format!("{n} {state}"),
     }
+}
+
+/// Pluralising suffix for a count. Here rather than in `ui.rs` so the command
+/// results in `main.rs` can reach it too.
+pub fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Compact duration for the pause badge: `45s`, `12m`, `2h5m`.

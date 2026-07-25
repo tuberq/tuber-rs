@@ -1,5 +1,6 @@
 use crate::app::{
-    format_secs, kick_plan, kick_target, parse_count, parse_duration, App, Mode, PromptKind,
+    format_secs, kick_plan, kick_target, parse_count, parse_duration, plural, App, Mode,
+    PromptKind, Selection,
 };
 use tuber_lib::model::{ServerStats, TubeStats};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -8,9 +9,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+/// Rows the server totals footer occupies: the rule, and the totals row itself.
+const FOOTER_ROWS: usize = 2;
+/// Tube rows the chart keeps before it will spend any on the footer. Reserving
+/// the footer unconditionally left a short frame showing totals and no tubes.
+const ROWS_BEFORE_FOOTER: usize = 2;
 /// Chart rows consumed by its own chrome: bottom border, column header line,
-/// and the server totals footer with the rule above it.
-const CHART_OVERHEAD: usize = 4;
+/// and the footer.
+const CHART_OVERHEAD: usize = 2 + FOOTER_ROWS;
 /// Tube rows the chart keeps even when the timing table wants more space.
 const CHART_MIN_ROWS: usize = 4;
 /// Stats panel rows that are always present: top border and the two
@@ -19,6 +25,9 @@ const CHART_MIN_ROWS: usize = 4;
 const STATS_FIXED: usize = 3;
 /// Width of the dim label starting each detail line.
 const DETAIL_LABEL: usize = 9;
+/// What separates the top bar's fields. Wider than the detail pane's middot
+/// because the bar's fields are whole clauses rather than value-and-unit pairs.
+const BAR_SEP: &str = " | ";
 /// Most of the space below the top bar the chart may claim before the timing
 /// table gets a look in.
 const CHART_MAX_SHARE: (usize, usize) = (2, 3);
@@ -50,51 +59,82 @@ const BAR_MIN: usize = 6;
 /// Below this a truncated name identifies nothing, so there is no point trading
 /// further width for it.
 const NAME_MIN: usize = 6;
+/// Longest the name column may grow to. Past this a name is buying width from
+/// the columns that carry the numbers, which is the wrong trade.
+const NAME_MAX: usize = 20;
+/// Width the pause badge needs — ` PAUSED 12m` and a column's slack — held back
+/// from the bar only while some visible tube is actually paused.
+const PAUSE_RESERVE: usize = 12;
 
-/// The job states a tube reports, in bar order: header label and colour. The
-/// colour is used for the header, the count and the bar fill, which is what
-/// lets the header line double as the legend.
-const STATES: [(&str, Color); 5] = [
-    ("ready", Color::Green),
-    ("urgnt", Color::Rgb(255, 165, 0)),
-    ("resvd", Color::Yellow),
-    ("delay", Color::Blue),
-    ("buried", Color::Red),
+/// The job states a tube reports, in bar order: header label, the same state
+/// spelled out, and colour. The colour is used for the header, the count and the
+/// bar fill, which is what lets the header line double as the legend.
+///
+/// The long name is here rather than in a parallel array because the two are
+/// only ever indexed together: the chart's headers are abbreviated to fit a
+/// six-column field, and the detail pane's running text is not.
+const STATES: [(&str, &str, Color); 5] = [
+    ("ready", "ready", Color::Green),
+    ("urgnt", "urgent", Color::Rgb(255, 165, 0)),
+    ("resvd", "reserved", Color::Yellow),
+    ("delay", "delayed", Color::Blue),
+    ("buried", "buried", Color::Red),
 ];
 
-/// The same states spelled out, for the detail pane's running text. The chart's
-/// headers are abbreviated to fit a six-column field; a sentence is not.
-const STATE_NAMES: [&str; 5] = ["ready", "urgent", "reserved", "delayed", "buried"];
-
-/// A tube's counts, indexed to match [`STATES`].
+/// Counts indexed to match [`STATES`].
 ///
 /// Ready is net of urgent: `current-jobs-urgent` is a subset of
 /// `current-jobs-ready`, so the two columns would otherwise double-count it and
-/// stop summing to the total.
-fn state_counts(tube: &TubeStats) -> [u64; 5] {
+/// stop summing to the total. Written once and fed by both callers below, so a
+/// tube's columns and the server's cannot come to disagree about that.
+fn state_counts(ready: u64, urgent: u64, reserved: u64, delayed: u64, buried: u64) -> [u64; 5] {
     [
-        tube.current_jobs_ready.saturating_sub(tube.current_jobs_urgent),
+        ready.saturating_sub(urgent),
+        urgent,
+        reserved,
+        delayed,
+        buried,
+    ]
+}
+
+/// A tube's counts.
+fn tube_counts(tube: &TubeStats) -> [u64; 5] {
+    state_counts(
+        tube.current_jobs_ready,
         tube.current_jobs_urgent,
         tube.current_jobs_reserved,
         tube.current_jobs_delayed,
         tube.current_jobs_buried,
-    ]
+    )
 }
 
-/// The server's own totals, indexed to match [`STATES`].
+/// The server's own totals.
 ///
 /// Deliberately the server's figures rather than the sum of the rows on screen:
 /// the chart hides empty tubes and scrolls, so a column sum would change as you
 /// navigate, which is useless for the number you are watching. `current-jobs-urgent`
 /// is on the wire in the global stats — it was simply never parsed.
-fn server_state_counts(server: &ServerStats) -> [u64; 5] {
-    [
-        server.current_jobs_ready.saturating_sub(server.current_jobs_urgent),
+fn server_counts(server: &ServerStats) -> [u64; 5] {
+    state_counts(
+        server.current_jobs_ready,
         server.current_jobs_urgent,
         server.current_jobs_reserved,
         server.current_jobs_delayed,
         server.current_jobs_buried,
-    ]
+    )
+}
+
+/// How many rows the totals footer gets in a chart body of `body` rows.
+///
+/// The tubes are the point of the chart, so the footer only claims its rows
+/// while the list keeps a couple of its own. `split_bottom` budgets against
+/// [`CHART_OVERHEAD`] and the renderer asks this, so the two agree about the
+/// chrome by construction rather than by both counting to four.
+fn footer_rows(body: usize) -> usize {
+    match body >= FOOTER_ROWS + ROWS_BEFORE_FOOTER {
+        true => FOOTER_ROWS,
+        false => 0,
+    }
 }
 
 /// Split the space below the top bar between the tube chart and the Stats
@@ -149,13 +189,21 @@ pub fn render(frame: &mut Frame, app: &App) {
     // agree on what is selected only by coincidence rather than by construction.
     let visible = app.visible_tubes();
 
+    // Derived once from the two snapshots and passed to both consumers, which
+    // cannot then report different figures for the same interval.
+    let rates = app.server_rates();
+
     // The pane's content decides its height, so it is built before the layout
     // rather than after — the lines are the measurement. Which set of lines
-    // depends only on where the cursor is; there is no mode to be in.
-    let detail = match app.selected_tube() {
-        Some(tube) => tube_detail_lines(tube),
-        None if app.server_selected() => match app.current.as_ref() {
-            Some(snap) => server_detail_lines(&snap.server, app),
+    // depends only on where the cursor is; there is no mode to be in, which is
+    // why this is one match on the selection rather than a probe per case.
+    let detail = match &app.selected {
+        Some(Selection::Server) => match app.current.as_ref() {
+            Some(snap) => server_detail_lines(&snap.server, rates),
+            None => Vec::new(),
+        },
+        Some(Selection::Tube(_)) => match app.selected_tube() {
+            Some(tube) => tube_detail_lines(tube),
             None => Vec::new(),
         },
         None => Vec::new(),
@@ -176,7 +224,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_top_bar(frame, app, chunks[0], top_lines);
     render_tube_chart(frame, app, chunks[1], &visible);
-    render_bottom_panel(frame, app, chunks[2], detail, detail_rows);
+    render_bottom_panel(frame, app, chunks[2], rates, detail, detail_rows);
     render_prompt_overlay(frame, app, area);
 }
 
@@ -313,29 +361,30 @@ fn top_bar_lines(app: &App) -> Vec<Line<'static>> {
         name => format!("{server_version} \u{2014} {name}"),
     };
 
-    let mut identity = vec![
-        Span::raw(format!(" {server_label}")),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("up {}", format_uptime(s.uptime))),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!(
-            "conns: {} (producers:{} workers:{} waiting:{})",
-            s.current_connections, s.current_producers, s.current_workers, s.current_waiting
-        )),
-    ];
-    if s.draining {
-        identity.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        identity.push(Span::styled(
-            "DRAINING",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-    }
+    let identity = join_with(
+        BAR_SEP,
+        vec![
+            vec![Span::raw(format!(" {server_label}"))],
+            vec![Span::raw(format!("up {}", format_uptime(s.uptime)))],
+            vec![Span::raw(format!(
+                "conns: {} (producers:{} workers:{} waiting:{})",
+                s.current_connections, s.current_producers, s.current_workers, s.current_waiting
+            ))],
+            match s.draining {
+                true => vec![Span::styled(
+                    "DRAINING",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )],
+                false => Vec::new(),
+            },
+        ],
+    );
 
     // Headroom: the numbers that turn into an outage if you look away. Absolute
     // figures ride along because there is room for them once the detail has gone.
     let mut headroom: Vec<Vec<Span<'static>>> = Vec::new();
     if s.max_jobs_size > 0 {
-        let pct = s.current_jobs_size as f64 / s.max_jobs_size as f64 * 100.0;
+        let pct = percent(s.current_jobs_size, s.max_jobs_size);
         headroom.push(labelled(
             "Mem",
             format!(
@@ -350,14 +399,14 @@ fn top_bar_lines(app: &App) -> Vec<Line<'static>> {
         headroom.push(labelled("Mem", format_bytes(s.current_jobs_size), Color::Reset));
     }
     if s.toast_total_bytes > 0 {
-        let pct = s.toast_live_bytes as f64 / s.toast_total_bytes as f64 * 100.0;
         // Live share, not usage: a low figure is fragmentation awaiting
         // compaction, so the usual thresholds would colour it backwards.
+        let pct = percent(s.toast_live_bytes, s.toast_total_bytes);
         headroom.push(labelled("TOAST", format!("{pct:.0}% live"), Color::Reset));
     }
     if s.max_storage_bytes > 0 {
         let used = s.binlog_total_bytes + s.toast_total_bytes;
-        let pct = used as f64 / s.max_storage_bytes as f64 * 100.0;
+        let pct = percent(used, s.max_storage_bytes);
         headroom.push(labelled(
             "Disk",
             format!(
@@ -373,12 +422,7 @@ fn top_bar_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(identity)];
     if !headroom.is_empty() {
         let mut spans = vec![Span::raw(" ")];
-        for (i, frag) in headroom.into_iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-            }
-            spans.extend(frag);
-        }
+        spans.extend(join_with(BAR_SEP, headroom));
         lines.push(Line::from(spans));
     }
     lines
@@ -406,11 +450,12 @@ fn chart_title(scope: &str, toggle: &str, width: u16) -> String {
         format!(" Tubes ({scope}) {arrows} p K s e q "),
         format!(" Tubes ({scope}) "),
     ];
-    candidates
+    // The shortest form is the fallback, so there is always an answer.
+    let fits = candidates
         .iter()
-        .find(|t| t.chars().count() <= width as usize)
-        .unwrap_or(candidates.last().expect("candidates is non-empty"))
-        .clone()
+        .position(|t| t.chars().count() <= width as usize)
+        .unwrap_or(candidates.len() - 1);
+    candidates.into_iter().nth(fits).expect("position is in range")
 }
 
 fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeStats]) {
@@ -461,10 +506,7 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
     // server totals footer. What is left in between scrolls.
     let header_height = inner.height.min(1);
     let body = inner.height.saturating_sub(header_height);
-    // The tubes are the point of the chart, so the footer only claims its two
-    // rows while the list keeps at least two of its own. Reserving them
-    // unconditionally left a frame this short showing totals and no tubes.
-    let footer_height = if body >= 4 { 2 } else { 0 };
+    let footer_height = footer_rows(body as usize) as u16;
     let chart_height = body.saturating_sub(footer_height) as usize;
     let header_area = Rect {
         height: header_height,
@@ -485,84 +527,53 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
         _ => 0,
     };
 
-    // Find max name length for alignment
-    let max_name_len = tubes.iter().map(|t| t.name.len()).max().unwrap_or(0).min(20);
+    // Everything the layout needs to know about the list, in one pass over it.
+    let metrics = ChartMetrics::measure(tubes);
 
-    // Reserve space for the pause badge only when something is actually paused,
-    // so the common case keeps its full bar width.
-    let pause_reserve = if tubes.iter().any(|t| t.is_paused()) { 12 } else { 0 };
-
-    // A state earns a column only when some visible tube has jobs in it.
-    // Decided once for the whole frame rather than per row, which is the point:
-    // every row keeps the same columns, so the numbers line up and a column's
-    // position identifies its state — while a state nobody is using spends no
-    // width at all.
-    let columns = active_columns(tubes, app.current.as_ref().map(|s| &s.server));
+    // Every row carries every state, so a column's position identifies it and
+    // the numbers line up both down the screen and between polls.
+    let columns = active_columns();
+    // Space for the pause badge is reserved only when something is actually
+    // paused, so the common case keeps its full bar width.
     let (name_width, bar_width, show_ewma) = row_widths(
         inner.width as usize,
-        max_name_len,
+        metrics.max_name_len,
         column_block_width(&columns),
-        pause_reserve,
+        if metrics.any_paused { PAUSE_RESERVE } else { 0 },
     );
-
-    // The busiest visible tube sets the bar scale, so bar lengths are
-    // comparable down the column.
-    let max_total = tubes.iter().map(|t| t.current_total()).max().unwrap_or(0);
+    let max_total = metrics.max_total;
 
     let mut lines = Vec::new();
     for (row, tube) in tubes.iter().enumerate().skip(offset).take(chart_height) {
         let is_selected = selected == Some(row);
         let total = tube.current_total();
-        let counts = state_counts(tube);
-
-        let mut spans = vec![
-            Span::styled(
-                if is_selected { "\u{258c}" } else { " " },
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                format!("{:>width$}", truncate_name(&tube.name, name_width), width = name_width),
-                if is_selected {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            ),
-        ];
+        let counts = tube_counts(tube);
 
         // Total leads the breakdown, so the row reads whole-then-parts: "908
-        // total, made of 5 ready, 10 delayed, 893 buried".
-        let total_display = format!("{:>width$}", format_number(total), width = GAP + TOTAL_WIDTH);
-        spans.push(if total == 0 {
-            Span::styled(total_display, Style::default().fg(Color::DarkGray))
-        } else {
-            Span::raw(total_display)
-        });
-
-        // Growth chevron, qualifying the total it follows. queue_change_indicator
-        // yields a glyph on every arm, so this needs no emptiness guard — but
-        // the width is held even before there is a previous total to compare.
-        match app.previous_tube_total(&tube.name) {
-            Some(prev_total) => {
-                let (chevron, color) = queue_change_indicator(prev_total, total);
-                spans.push(Span::styled(format!(" {chevron}"), Style::default().fg(color)));
-            }
-            None => spans.push(Span::raw(" ".repeat(TREND_WIDTH))),
-        }
+        // total, made of 5 ready, 10 delayed, 893 buried". The growth chevron
+        // qualifies the total it follows; queue_change_indicator yields a glyph
+        // on every arm, so there is one whenever a previous total exists.
+        let mut spans = row_prefix(
+            is_selected,
+            &tube.name,
+            name_width,
+            if is_selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+            total,
+            if total == 0 {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            },
+            app.previous_tube_total(&tube.name)
+                .map(|prev_total| queue_change_indicator(prev_total, total)),
+        );
 
         // Each count carries its state's colour, so the number is its own key.
-        // A state holding nothing gets a dim placeholder rather than a zero: the
-        // column has to keep its place, but a screenful of zeros reads as data.
-        for (n, &state) in columns.iter().enumerate() {
-            let (text, color) = match counts[state] {
-                0 => ("\u{00b7}".to_string(), Color::DarkGray),
-                count => (format_number(count), STATES[state].1),
-            };
-            spans.push(Span::styled(
-                format!("{:>width$}", text, width = count_field_width(n)),
-                Style::default().fg(color),
-            ));
-        }
+        spans.extend(count_spans(&counts, &columns, Modifier::empty()));
 
         if bar_width > 0 {
             spans.push(Span::raw(" ".repeat(GAP)));
@@ -575,10 +586,10 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
         if show_ewma {
             let text = match total > 0 && tube.processing_time_ewma > 0.0 {
                 true => format_duration(tube.processing_time_ewma),
-                false => format!("{:>6}", "\u{00b7}"),
+                false => "\u{00b7}".to_string(),
             };
             spans.push(Span::styled(
-                format!(" {text}"),
+                format!("{:>width$}", text, width = EWMA_WIDTH),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -615,7 +626,7 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
     for (n, &state) in columns.iter().enumerate() {
         header.push(Span::styled(
             format!("{:>width$}", STATES[state].0, width = count_field_width(n)),
-            Style::default().fg(STATES[state].1),
+            Style::default().fg(STATES[state].2),
         ));
     }
     if bar_width > 0 {
@@ -630,68 +641,13 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
             Style::default().fg(Color::DarkGray),
         ));
     }
-    frame.render_widget(Paragraph::new(vec![Line::from(header.clone())]), header_area);
+    // Measured before the spans are handed over, so the scroll indicator below
+    // can place itself without keeping a copy of the whole header alive.
+    let header_width: usize = header.iter().map(|s| s.content.chars().count()).sum();
+    frame.render_widget(Paragraph::new(vec![Line::from(header)]), header_area);
 
-    // Server totals, in the columns the rows established. This is the breakdown
-    // the top bar used to carry as 61 columns of `jobs: 1789923 ready, 381
-    // reserved, ...` — as a footer it costs no width at all and needs no labels,
-    // because the columns above it already have them.
-    if footer_height == 2 {
-        if let Some(server) = app.current.as_ref().map(|s| &s.server) {
-            let totals = server_state_counts(server);
-            let numeric: usize = GAP + TOTAL_WIDTH + TREND_WIDTH + column_block_width(&columns);
-            frame.render_widget(
-                Paragraph::new(vec![Line::from(vec![
-                    Span::raw(" ".repeat(CURSOR_WIDTH as usize + name_width + 1)),
-                    Span::styled(
-                        "\u{2500}".repeat(numeric.saturating_sub(1)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])]),
-                Rect { height: 1, ..footer_area },
-            );
-
-            // The totals row takes the cursor like any other, because it is
-            // selectable like any other — that is what turns the detail pane
-            // over to the server.
-            let on_server = app.server_selected();
-            let mut row = vec![
-                Span::styled(
-                    if on_server { "\u{258c}" } else { " " },
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!("{:>width$}", "server", width = name_width),
-                    if on_server {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-                Span::styled(
-                    format!("{:>width$}", format_number(totals.iter().sum()), width = GAP + TOTAL_WIDTH),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" ".repeat(TREND_WIDTH)),
-            ];
-            for (n, &state) in columns.iter().enumerate() {
-                let (text, style) = match totals[state] {
-                    0 => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
-                    count => (
-                        format_number(count),
-                        Style::default().fg(STATES[state].1).add_modifier(Modifier::BOLD),
-                    ),
-                };
-                row.push(Span::styled(
-                    format!("{:>width$}", text, width = count_field_width(n)),
-                    style,
-                ));
-            }
-            frame.render_widget(
-                Paragraph::new(vec![Line::from(row)]),
-                Rect { y: footer_area.y + 1, height: 1, ..footer_area },
-            );
-        }
+    if footer_height > 0 {
+        render_totals_footer(frame, app, footer_area, &columns, name_width);
     }
 
     // Scroll position, when the list does not all fit. Right-aligned over the
@@ -709,7 +665,6 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
         // On a narrow terminal the labels reach the right edge and this used to
         // paint straight over `buried` — losing the column that matters most to
         // report a scroll position you can infer from the cursor anyway.
-        let header_width: usize = header.iter().map(|s| s.content.chars().count()).sum();
         if header_width + pos.chars().count() <= inner.width as usize {
             frame.render_widget(
                 Paragraph::new(vec![Line::from(Span::styled(
@@ -721,6 +676,62 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
             );
         }
     }
+}
+
+/// The server's totals, in the columns the rows established, under a rule that
+/// spans just the numeric block.
+///
+/// This is the breakdown the top bar used to carry as 61 columns of
+/// `jobs: 1789923 ready, 381 reserved, ...` — as a footer it costs no width at
+/// all and needs no labels, because the columns above it already have them.
+///
+/// It takes the cursor like any other row, because it *is* selectable like any
+/// other — that is what turns the detail pane over to the server. It carries no
+/// bar or ewma: neither means anything for a server as a whole.
+fn render_totals_footer(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    columns: &[usize],
+    name_width: usize,
+) {
+    let Some(server) = app.current.as_ref().map(|s| &s.server) else {
+        return;
+    };
+    let totals = server_counts(server);
+
+    let numeric = GAP + TOTAL_WIDTH + TREND_WIDTH + column_block_width(columns);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(vec![
+            Span::raw(" ".repeat(CURSOR_WIDTH as usize + name_width + 1)),
+            Span::styled(
+                "\u{2500}".repeat(numeric.saturating_sub(1)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])]),
+        Rect { height: 1, ..area },
+    );
+
+    let on_server = app.server_selected();
+    let mut row = row_prefix(
+        on_server,
+        Selection::Server.label(),
+        name_width,
+        if on_server {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+        totals.iter().sum(),
+        Style::default().add_modifier(Modifier::BOLD),
+        None,
+    );
+    row.extend(count_spans(&totals, columns, Modifier::BOLD));
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(row)]),
+        Rect { y: area.y + 1, height: 1, ..area },
+    );
 }
 
 /// Divide a row's width between the parts that can give way, returning
@@ -764,18 +775,55 @@ fn row_widths(
     (name_width, bar_width, show_ewma)
 }
 
-/// Indices into [`STATES`] that any of `tubes` — or the server as a whole — has
-/// jobs in.
+/// The state columns, which is all of them, always.
 ///
-/// The server's totals count because the footer row renders in these columns: a
-/// state whose only jobs are in tubes the chart is hiding would otherwise have a
-/// total with no column to sit in. It is also the more useful answer — 2196
-/// buried jobs matter whether or not the tube holding them is on screen.
-fn active_columns(tubes: &[&TubeStats], server: Option<&ServerStats>) -> Vec<usize> {
-    let totals = server.map(server_state_counts).unwrap_or([0; 5]);
-    (0..STATES.len())
-        .filter(|&i| totals[i] > 0 || tubes.iter().any(|t| state_counts(t)[i] > 0))
-        .collect()
+/// This used to drop any state that neither the visible tubes nor the server had
+/// jobs in, on the reasoning that alignment should not cost width it was not
+/// using. That was the wrong axis to optimise. The columns held still down the
+/// screen but moved *between polls*: a tube's last delayed job finishing removed
+/// the `delay` column and shifted everything after it sideways, so on a live
+/// dashboard the numbers you were reading jumped under you. Stability over time
+/// is worth more than the seven columns, and all five still fit an 80-column
+/// terminal with the bar at its floor.
+fn active_columns() -> Vec<usize> {
+    (0..STATES.len()).collect()
+}
+
+/// What one look at the visible tubes tells the layout.
+///
+/// Gathered in a single pass rather than one question at a time: these three
+/// answers used to cost three separate scans of the list, on every frame.
+struct ChartMetrics {
+    /// Widest name on screen, capped — past `NAME_MAX` a name is buying width
+    /// from the columns that carry the numbers.
+    max_name_len: usize,
+    any_paused: bool,
+    /// The busiest visible tube, which sets the bar scale so that bar lengths
+    /// are comparable down the column.
+    max_total: u64,
+}
+
+impl ChartMetrics {
+    fn measure(tubes: &[&TubeStats]) -> Self {
+        let mut metrics = ChartMetrics {
+            // The totals row is a row, so its label negotiates for the name
+            // column like any tube's. Left out, a list of short names sized the
+            // column under "server" — which then either overflowed, pushing the
+            // footer's numbers out of line with the columns they total, or
+            // truncated to "s".
+            max_name_len: Selection::Server.label().chars().count(),
+            any_paused: false,
+            max_total: 0,
+        };
+        for tube in tubes {
+            // Counted in characters, not bytes, to match `truncate_name`.
+            metrics.max_name_len = metrics.max_name_len.max(tube.name.chars().count());
+            metrics.any_paused |= tube.is_paused();
+            metrics.max_total = metrics.max_total.max(tube.current_total());
+        }
+        metrics.max_name_len = metrics.max_name_len.min(NAME_MAX);
+        metrics
+    }
 }
 
 /// Width of the `n`th count field, gap included. The first field carries the
@@ -784,6 +832,67 @@ fn active_columns(tubes: &[&TubeStats], server: Option<&ServerStats>) -> Vec<usi
 /// aligned.
 fn count_field_width(n: usize) -> usize {
     COUNT_WIDTH + if n == 0 { GAP } else { 1 }
+}
+
+/// The count block of a chart row: one right-aligned field per active column,
+/// each in its state's colour.
+///
+/// A state holding nothing gets a dim placeholder rather than a zero: the column
+/// has to keep its place, but a screenful of zeros reads as data. Shared by the
+/// tube rows and the totals footer so the two cannot drift out of alignment —
+/// which is the whole point of the columns.
+fn count_spans(counts: &[u64; 5], columns: &[usize], emphasis: Modifier) -> Vec<Span<'static>> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(n, &state)| {
+            let (text, style) = match counts[state] {
+                0 => ("\u{00b7}".to_string(), Style::default().fg(Color::DarkGray)),
+                count => (
+                    format_number(count),
+                    Style::default().fg(STATES[state].2).add_modifier(emphasis),
+                ),
+            };
+            Span::styled(format!("{:>width$}", text, width = count_field_width(n)), style)
+        })
+        .collect()
+}
+
+/// The leading block of a chart row: cursor, right-aligned name, total, and the
+/// trend column.
+///
+/// The trend's width is held even when there is no chevron for it — on the first
+/// poll, or on the totals row — so the counts after it start in the same place
+/// on every row.
+fn row_prefix(
+    selected: bool,
+    name: &str,
+    name_width: usize,
+    name_style: Style,
+    total: u64,
+    total_style: Style,
+    trend: Option<(&'static str, Color)>,
+) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            if selected { "\u{258c}" } else { " " },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("{:>width$}", truncate_name(name, name_width), width = name_width),
+            name_style,
+        ),
+        Span::styled(
+            format!("{:>width$}", format_number(total), width = GAP + TOTAL_WIDTH),
+            total_style,
+        ),
+        match trend {
+            Some((chevron, colour)) => {
+                Span::styled(format!(" {chevron}"), Style::default().fg(colour))
+            }
+            None => Span::raw(" ".repeat(TREND_WIDTH)),
+        },
+    ]
 }
 
 /// Total width of the count block, gaps included.
@@ -851,7 +960,7 @@ fn size_bar_spans(
         .enumerate()
         .filter(|(_, &n)| n > 0)
         .map(|(i, &n)| {
-            Span::styled("\u{2588}".repeat(n), Style::default().fg(STATES[i].1))
+            Span::styled("\u{2588}".repeat(n), Style::default().fg(STATES[i].2))
         })
         .collect();
     if filled < width {
@@ -878,6 +987,7 @@ fn render_bottom_panel(
     frame: &mut Frame,
     app: &App,
     area: Rect,
+    rates: (f64, f64, f64, f64),
     detail: Vec<DetailLine>,
     detail_rows: usize,
 ) {
@@ -888,7 +998,7 @@ fn render_bottom_panel(
         return;
     };
 
-    let (puts_s, reserves_s, deletes_s, timeouts_s) = app.server_rates();
+    let (puts_s, reserves_s, deletes_s, timeouts_s) = rates;
 
     let line1 = Line::from(vec![
         Span::styled(" Throughput: ", Style::default().fg(Color::DarkGray)),
@@ -932,7 +1042,7 @@ fn render_bottom_panel(
     // lines are already in reading order, so a truncated pane keeps its most
     // useful half rather than an arbitrary one.
     if detail_rows > 0 {
-        if let Some(name) = app.selected.as_ref().map(|s| s.tube_name().unwrap_or("server")) {
+        if let Some(name) = app.selected.as_ref().map(Selection::label) {
             let rule = area.width as usize;
             let heading = format!(" {name} ");
             // A dropped line is worth saying so — an absent `oldest` row reads
@@ -971,7 +1081,7 @@ fn render_bottom_panel(
 /// Kept as a struct rather than a finished `Line` so the pane can be built and
 /// counted before the layout is decided, then rendered afterwards — the height
 /// depends on the content, so the content has to come first.
-pub struct DetailLine {
+struct DetailLine {
     label: &'static str,
     spans: Vec<Span<'static>>,
 }
@@ -987,16 +1097,28 @@ impl DetailLine {
     }
 }
 
-/// Join `parts` with a dim middot, dropping any that are empty.
-fn joined(parts: Vec<Vec<Span<'static>>>) -> Vec<Span<'static>> {
+/// Join `parts` with a dim `sep`, dropping any that are empty.
+///
+/// Dropping them is the point: a fragment is omitted by building it empty, so
+/// callers can list every field they might show without also having to work out
+/// which separators survive.
+fn join_with(sep: &str, parts: Vec<Vec<Span<'static>>>) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
     for part in parts.into_iter().filter(|p| !p.is_empty()) {
         if !out.is_empty() {
-            out.push(Span::styled(" \u{00b7} ", Style::default().fg(Color::DarkGray)));
+            out.push(Span::styled(
+                sep.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         out.extend(part);
     }
     out
+}
+
+/// Join `parts` with a dim middot — the detail pane's separator.
+fn joined(parts: Vec<Vec<Span<'static>>>) -> Vec<Span<'static>> {
+    join_with(" \u{00b7} ", parts)
 }
 
 /// `value label` with the value plain and the unit dimmed. An empty label emits
@@ -1021,17 +1143,18 @@ fn pair(value: String, label: &str) -> Vec<Span<'static>> {
 /// the watcher counts — parsed on every poll and never displayed.
 fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
     let mut lines = Vec::new();
-    let counts = state_counts(tube);
+    let counts = tube_counts(tube);
 
-    // Jobs held, by state, in the same colours and order as the chart's columns.
+    // Jobs held, by state, in the same colours and order as the chart's columns
+    // — spelled out here, where a sentence has the room the headers do not.
     let jobs = joined(
         (0..STATES.len())
             .filter(|&i| counts[i] > 0)
             .map(|i| {
                 vec![
-                    Span::styled(format_number(counts[i]), Style::default().fg(STATES[i].1)),
+                    Span::styled(format_number(counts[i]), Style::default().fg(STATES[i].2)),
                     Span::styled(
-                        format!(" {}", STATE_NAMES[i]),
+                        format!(" {}", STATES[i].1),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]
@@ -1058,15 +1181,15 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
     // of the server's settings.
     let mut timing: Vec<Vec<Span<'static>>> = Vec::new();
     if tube.processing_time_samples_fast > 0 {
-        timing.push(pair(tight(tube.processing_time_ewma_fast), "fast"));
+        timing.push(pair(format_duration(tube.processing_time_ewma_fast), "fast"));
     }
     if tube.processing_time_samples_slow > 0 {
-        timing.push(pair(tight(tube.processing_time_ewma_slow), "slow"));
+        timing.push(pair(format_duration(tube.processing_time_ewma_slow), "slow"));
     }
     if tube.processing_time_p50 > 0.0 {
-        timing.push(pair(tight(tube.processing_time_p50), "p50"));
-        timing.push(pair(tight(tube.processing_time_p95), "p95"));
-        timing.push(pair(tight(tube.processing_time_p99), "p99"));
+        timing.push(pair(format_duration(tube.processing_time_p50), "p50"));
+        timing.push(pair(format_duration(tube.processing_time_p95), "p95"));
+        timing.push(pair(format_duration(tube.processing_time_p99), "p99"));
     }
     if !timing.is_empty() {
         lines.push(DetailLine { label: "runtime", spans: joined(timing) });
@@ -1092,14 +1215,14 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
     // Waiting time and the spread behind the averages above.
     let mut queue: Vec<Vec<Span<'static>>> = Vec::new();
     if tube.queue_time_ewma > 0.0 {
-        queue.push(pair(tight(tube.queue_time_ewma), "in queue"));
+        queue.push(pair(format_duration(tube.queue_time_ewma), "in queue"));
     }
     if tube.processing_time_samples > 0 {
         queue.push(pair(
             format!(
                 "{}\u{2013}{}",
-                tight(tube.processing_time_min),
-                tight(tube.processing_time_max)
+                format_duration(tube.processing_time_min),
+                format_duration(tube.processing_time_max)
             ),
             &format!("over {} runs", format_number(tube.processing_time_samples)),
         ));
@@ -1157,9 +1280,9 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
 /// body tallies, the command totals, the host triple — and to the fast/slow
 /// threshold, which is server configuration and so belongs here rather than
 /// restated on every tube's runtime line.
-fn server_detail_lines(server: &ServerStats, app: &App) -> Vec<DetailLine> {
+fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec<DetailLine> {
     let mut lines = Vec::new();
-    let (puts_s, reserves_s, deletes_s, timeouts_s) = app.server_rates();
+    let (puts_s, reserves_s, deletes_s, timeouts_s) = rates;
 
     lines.push(DetailLine {
         label: "rates",
@@ -1183,7 +1306,7 @@ fn server_detail_lines(server: &ServerStats, app: &App) -> Vec<DetailLine> {
     let mut memory = vec![match server.max_jobs_size {
         0 => pair(format_bytes(server.current_jobs_size), "in jobs"),
         max => {
-            let pct = server.current_jobs_size as f64 / max as f64 * 100.0;
+            let pct = percent(server.current_jobs_size, max);
             vec![
                 Span::styled(
                     format!(
@@ -1208,7 +1331,7 @@ fn server_detail_lines(server: &ServerStats, app: &App) -> Vec<DetailLine> {
 
     if server.max_storage_bytes > 0 {
         let used = server.binlog_total_bytes + server.toast_total_bytes;
-        let pct = used as f64 / server.max_storage_bytes as f64 * 100.0;
+        let pct = percent(used, server.max_storage_bytes);
         lines.push(DetailLine {
             label: "disk",
             spans: vec![Span::styled(
@@ -1248,7 +1371,7 @@ fn server_detail_lines(server: &ServerStats, app: &App) -> Vec<DetailLine> {
     if server.toast_segments > 0 || server.toast_total_bytes > 0 {
         let mut toast = Vec::new();
         if server.toast_total_bytes > 0 {
-            let pct = server.toast_live_bytes as f64 / server.toast_total_bytes as f64 * 100.0;
+            let pct = percent(server.toast_live_bytes, server.toast_total_bytes);
             // Abbreviated deliberately: with every counter present this line is
             // the widest the pane produces, and it has to fit 80 columns.
             toast.push(pair(
@@ -1335,7 +1458,7 @@ fn server_detail_lines(server: &ServerStats, app: &App) -> Vec<DetailLine> {
     lines.push(DetailLine {
         label: "tuning",
         spans: joined(vec![
-            pair(tight(server.processing_time_fast_threshold), "fast/slow split"),
+            pair(format_duration(server.processing_time_fast_threshold), "fast/slow split"),
             pair(format_number(server.total_jobs), "jobs ever"),
         ]),
     });
@@ -1356,6 +1479,15 @@ fn server_detail_lines(server: &ServerStats, app: &App) -> Vec<DetailLine> {
     }
 
     lines
+}
+
+/// `part` as a percentage of `whole`, for the used-of-available figures the top
+/// bar and the server pane both report.
+fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    part as f64 / whole as f64 * 100.0
 }
 
 /// The colour a used-of-available percentage earns. Shared so the top bar and
@@ -1394,11 +1526,6 @@ fn trim_zero(big: u64, small: u64, big_unit: char, small_unit: char) -> String {
     } else {
         format!("{big}{big_unit}{small}{small_unit}")
     }
-}
-
-/// `format_duration` without its right-aligning pad, for running text.
-fn tight(seconds: f64) -> String {
-    format_duration(seconds).trim().to_string()
 }
 
 fn format_uptime(seconds: u64) -> String {
@@ -1460,8 +1587,14 @@ fn queue_change_indicator(prev_total: u64, curr_total: u64) -> (&'static str, Co
     }
 }
 
+/// A duration at the scale it reads best: `82ms`, `2.4s`, `13.0m`, `1.5h`.
+///
+/// Unpadded. Nine of its ten callers are running text in the detail pane, and
+/// the tenth — the chart's ewma column — right-aligns it to `EWMA_WIDTH` along
+/// with the placeholder that stands in for it, so the column's width is stated
+/// once, where the column is built.
 fn format_duration(seconds: f64) -> String {
-    let raw = if seconds < 1.0 {
+    if seconds < 1.0 {
         format!("{:.0}ms", seconds * 1000.0)
     } else if seconds < 600.0 {
         format!("{:.1}s", seconds)
@@ -1469,8 +1602,7 @@ fn format_duration(seconds: f64) -> String {
         format!("{:.1}m", seconds / 60.0)
     } else {
         format!("{:.1}h", seconds / 3600.0)
-    };
-    format!("{:>6}", raw)
+    }
 }
 
 /// Never wider than six columns, which is what the count columns are sized to.
@@ -1491,11 +1623,6 @@ fn format_number(n: u64) -> String {
         _ => return n.to_string(),
     };
     format!("{:.1}{unit}", n as f64 / divisor)
-}
-
-/// Pluralising suffix for a count.
-fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
 }
 
 #[cfg(test)]
@@ -2067,18 +2194,22 @@ mod tests {
         assert!(!draw_chart(&app, 65, 15)[HEADER_LINE].contains("ewma"));
     }
 
-    /// A state nothing is using spends no width — neither the visible tubes nor
-    /// the server as a whole.
+    /// Every state keeps its column whether anything is using it or not.
+    ///
+    /// The columns used to be chosen per frame from what had jobs in it, which
+    /// held them still down the screen but moved them *between polls*: a tube's
+    /// last delayed job finishing dropped the `delay` column and slid every
+    /// number after it sideways, on a display that repaints every second and a
+    /// half. Fixed columns that are sometimes empty beat columns that move.
     #[test]
-    fn an_unused_state_gets_no_column() {
+    fn every_state_keeps_its_column() {
         let quiet: Vec<TubeStats> = sample_tubes()
             .into_iter()
             .filter(|t| t.name == "book" || t.name == "series")
             .collect();
         let mut app = App::new("test:11300".to_string());
         app.update(Snapshot {
-            // Ready, delayed and buried only: the totals must not conjure a
-            // column that no tube on screen has a number for.
+            // Nothing anywhere — tube or server — is urgent or reserved.
             server: ServerStats::from_yaml(
                 "version: tuber 0.13.0\ncurrent-jobs-ready: 10004\n\
                  current-jobs-delayed: 1\ncurrent-jobs-buried: 145\n",
@@ -2087,15 +2218,44 @@ mod tests {
             fetched_at: Instant::now(),
         });
         let header = &draw_chart(&app, 130, 13)[HEADER_LINE];
-        assert!(header.contains("ready") && header.contains("delay") && header.contains("buried"));
-        assert!(!header.contains("urgnt"), "nothing has urgent jobs: {header:?}");
-        assert!(!header.contains("resvd"), "nothing has reserved jobs: {header:?}");
+        for state in STATES.iter().map(|(header, _, _)| *header) {
+            assert!(header.contains(state), "header dropped {state}: {header:?}");
+        }
     }
 
-    /// The server's totals earn a column even when every tube holding them is
-    /// hidden — 2196 buried jobs matter whether or not their tube is on screen.
+    /// The column set does not depend on the data, so it cannot shift as the
+    /// data changes. This is the property the previous behaviour lacked.
     #[test]
-    fn the_servers_totals_earn_their_columns() {
+    fn the_columns_do_not_move_between_polls() {
+        let busy = TubeStats::from_yaml(
+            "name: q\ncurrent-jobs-ready: 5\ncurrent-jobs-urgent: 2\n\
+             current-jobs-reserved: 1\ncurrent-jobs-delayed: 3\ncurrent-jobs-buried: 4\n",
+        );
+        // The same tube one poll later, with only ready jobs left.
+        let drained = TubeStats::from_yaml("name: q\ncurrent-jobs-ready: 5\n");
+
+        let header_for = |tube: TubeStats| {
+            let mut app = App::new("test:11300".to_string());
+            app.update(Snapshot {
+                server: ServerStats::from_yaml("version: tuber 0.13.0\ncurrent-jobs-ready: 5\n"),
+                tubes: vec![tube],
+                fetched_at: Instant::now(),
+            });
+            draw_chart(&app, 130, 13)[HEADER_LINE].clone()
+        };
+
+        assert_eq!(
+            header_for(busy),
+            header_for(drained),
+            "the header moved when the tube's states emptied"
+        );
+    }
+
+    /// The totals row carries the server's own figures, which can exceed
+    /// anything on screen — 2196 buried jobs matter whether or not the tube
+    /// holding them is visible.
+    #[test]
+    fn the_totals_row_reports_the_server_not_the_screen() {
         let mut app = App::new("test:11300".to_string());
         app.update(Snapshot {
             server: ServerStats::from_yaml(
@@ -2106,7 +2266,6 @@ mod tests {
             fetched_at: Instant::now(),
         });
         let lines = draw_chart(&app, 130, 13);
-        assert!(lines[HEADER_LINE].contains("buried"), "no buried column: {:?}", lines[HEADER_LINE]);
         let footer = lines.iter().find(|l| l.contains("server")).expect("no totals row");
         assert!(footer.contains("2.2K"), "totals row lacks the buried count: {footer:?}");
         // And the tube itself shows the placeholder, not the server's number.

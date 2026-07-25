@@ -1,7 +1,7 @@
 mod app;
 mod ui;
 
-use app::{format_secs, kick_target, parse_count, parse_duration, App, Mode, PromptKind};
+use app::{format_secs, kick_target, parse_count, parse_duration, plural, App, Mode, PromptKind};
 use clap::Parser;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -132,15 +132,16 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
     let (available, _) = kick_target(tube.current_jobs_buried, tube.current_jobs_delayed);
     let tube = tube.name.clone();
 
-    if kind == PromptKind::Kick && available == 0 {
-        app.set_status(format!("{tube} has no buried or delayed jobs"), false);
-        return;
-    }
-
+    // One match owns what each kind does, so the refusal and the prefill — both
+    // of them facts about Kick — are read together rather than ten lines apart.
     // The kick bound is prefilled with everything one kick can move, so the
-    // common case — clear the whole backlog — is Shift-K then Enter.
+    // common case, clearing the whole backlog, is Shift-K then Enter.
     let buf = match kind {
         PromptKind::Pause => String::new(),
+        PromptKind::Kick if available == 0 => {
+            app.set_status(format!("{tube} has no buried or delayed jobs"), false);
+            return;
+        }
         PromptKind::Kick => available.to_string(),
     };
     app.mode = Mode::Prompt { kind, tube, buf };
@@ -208,7 +209,7 @@ async fn run_command(client: &mut TuberClient, command: &Command) -> io::Result<
             let kicked = client.kick(*bound).await?;
             Ok(format!(
                 "{tube}: kicked {kicked} job{}",
-                if kicked == 1 { "" } else { "s" }
+                plural(kicked as usize)
             ))
         }
     }
