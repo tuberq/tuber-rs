@@ -34,8 +34,10 @@ const COUNT_WIDTH: usize = 6;
 /// against, so the columns after it do not shift once one arrives.
 const TOTAL_WIDTH: usize = 7;
 const TREND_WIDTH: usize = 2;
-/// Width of the trailing `(  2.4s)` timing suffix.
-const EWMA_WIDTH: usize = 9;
+/// Width of the trailing ewma column: a separating space and `format_duration`'s
+/// six. It used to be nine, holding `(  2.4s)` — the brackets were standing in
+/// for the column label it did not have.
+const EWMA_WIDTH: usize = 7;
 /// Bounds on the size bar. The cap is deliberately well short of the terminal
 /// width: the counts carry the precision, so the bar only has to say roughly how
 /// big and roughly what mix, and twenty cells over six decades of jobs says that
@@ -567,11 +569,16 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
             spans.extend(size_bar_spans(&counts, total, max_total, bar_width));
         }
 
-        // Timing suffix, for tubes actually holding work — an empty tube's row
-        // ends at its bar.
-        if show_ewma && total > 0 && tube.processing_time_ewma > 0.0 {
+        // The tube's overall processing ewma — the combined figure, not the
+        // bimodal pair, which the detail pane splits out. Rendered even when
+        // absent so the column holds its place, as the counts do.
+        if show_ewma {
+            let text = match total > 0 && tube.processing_time_ewma > 0.0 {
+                true => format_duration(tube.processing_time_ewma),
+                false => format!("{:>6}", "\u{00b7}"),
+            };
             spans.push(Span::styled(
-                format!(" ({})", format_duration(tube.processing_time_ewma)),
+                format!(" {text}"),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -614,6 +621,12 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
     if bar_width > 0 {
         header.push(Span::styled(
             format!("{}{:<bar$}", " ".repeat(GAP), "size", bar = bar_width),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if show_ewma {
+        header.push(Span::styled(
+            format!("{:>width$}", "ewma", width = EWMA_WIDTH),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -2010,6 +2023,48 @@ mod tests {
         });
         assert_eq!(top_bar_lines(&app).len(), 1, "no storage means one line");
         assert_eq!(top_bar_lines(&busy_server_app()).len(), 2);
+    }
+
+    /// The trailing duration is the tube's overall processing ewma, and it now
+    /// says so. It was the one unlabelled number in the table — brackets were
+    /// standing in for a column heading.
+    #[test]
+    fn the_ewma_column_is_labelled_and_aligned() {
+        let mut tubes = sample_tubes();
+        // A tube holding work but with no samples yet, so the column is empty.
+        tubes.push(TubeStats::from_yaml("name: idle-tube\ncurrent-jobs-ready: 3\n"));
+        let app = app_with_selection(tubes, "covers");
+        let lines = draw_chart(&app, 100, 15);
+
+        let header = &lines[HEADER_LINE];
+        let end = header.find("ewma").expect("no ewma header") + "ewma".len();
+        assert!(!header[..end].contains('('), "brackets left in the header");
+
+        // Every tube row's value ends in the header's last column, whether it
+        // has a figure or the placeholder.
+        let rule = lines
+            .iter()
+            .position(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c == '\u{2500}'))
+            .expect("no totals rule");
+        let mut seen_placeholder = false;
+        for line in &lines[HEADER_LINE + 1..rule] {
+            let row: Vec<char> = line.chars().collect();
+            if row.is_empty() {
+                continue;
+            }
+            assert_ne!(row[end - 1], ' ', "ewma not flush with its header: {line:?}");
+            seen_placeholder |= row[end - 1] == '\u{00b7}';
+            assert!(!line.contains('('), "brackets left in a row: {line:?}");
+        }
+        assert!(seen_placeholder, "a tube with no samples should show a placeholder");
+
+        // The bar gives way before the ewma does, so at 70 the column is still
+        // there with no bar beside it.
+        let seventy = &draw_chart(&app, 70, 15)[HEADER_LINE];
+        assert!(seventy.contains("ewma"), "ewma dropped before the bar: {seventy:?}");
+        assert!(!seventy.contains("size"), "bar kept at 70 columns: {seventy:?}");
+        // Narrower still and the column goes too, label and all.
+        assert!(!draw_chart(&app, 65, 15)[HEADER_LINE].contains("ewma"));
     }
 
     /// A state nothing is using spends no width — neither the visible tubes nor

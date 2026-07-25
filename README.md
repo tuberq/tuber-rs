@@ -165,10 +165,10 @@ paused tube at zero is exactly the one you need to see.
 | tuber 0.13.0 - gr | up 41m | conns: 105 (producers:68 workers:35 ...)   |
 | Mem: 77.7% (875.4MB / 1.1GB) | TOAST: 75% live | Disk: 57.1% (1.1/2.0G)|
 +------------------------------------------------------------------------+
-|              total     ready  urgnt  resvd  delay buried  size         |
-|     book    10.1K —     9.9K      ·      ·      ·    145  ███████░░░   |
-|   covers     1.6M ⇊     1.6M      ·    124     23      ·  ██████████   |
-|     work      907 ↓      109    780      4     14      ·  ████░░░░░░   |
+|              total     ready  urgnt  resvd  delay buried  size    ewma |
+|     book    10.1K —     9.9K      ·      ·      ·    145  ███████░  9ms |
+|   covers     1.6M ⇊     1.6M      ·    124     23      ·  ████████ 79ms |
+|     work      907 ↓      109    780      4     14      ·  ████░░░░ 10ms |
 |             ────────────────────────────────────────────               |
 |▌   server     1.9M       1.9M    988    343     17   1.0K              |
 +------------------------------------------------------------------------+
