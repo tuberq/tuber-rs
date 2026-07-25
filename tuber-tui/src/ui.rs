@@ -1,4 +1,6 @@
-use crate::app::{format_secs, parse_duration, App, Mode};
+use crate::app::{
+    format_secs, kick_plan, kick_target, parse_count, parse_duration, App, Mode, PromptKind,
+};
 use tuber_lib::model::TubeStats;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -99,38 +101,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_prompt_overlay(frame, app, area);
 }
 
-/// The pause prompt and command results share the last row of the frame, drawn
-/// over whatever is beneath so opening the prompt does not reflow the layout.
+/// The prompts and command results share the last row of the frame, drawn over
+/// whatever is beneath so opening a prompt does not reflow the layout.
 fn render_prompt_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.mode {
-        Mode::PausePrompt { tube, buf } => {
-            let mut spans = vec![
-                Span::styled(
-                    " Pause ",
-                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(" {tube} for: ")),
-                Span::styled(
-                    buf.clone(),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("\u{2588}", Style::default().fg(Color::DarkGray)),
-            ];
-            // The hint is the only feedback on a bad duration — Enter on
-            // unparseable input is a deliberate no-op, so this must say why.
-            let (hint, hint_style) = match parse_duration(buf) {
-                Some(0) => ("  = unpause now".to_string(), Color::DarkGray),
-                Some(secs) => (format!("  = {}", format_secs(secs as u64)), Color::DarkGray),
-                None if buf.is_empty() => ("  seconds, or 5m / 2h".to_string(), Color::DarkGray),
-                None => ("  not a duration".to_string(), Color::Red),
-            };
-            spans.push(Span::styled(hint, Style::default().fg(hint_style)));
-            spans.push(Span::styled(
-                "   Enter confirm  Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ));
-            Some(Line::from(spans))
-        }
+        Mode::Prompt { kind, tube, buf } => Some(prompt_line(app, *kind, tube, buf)),
         Mode::Normal => app.live_status().map(|status| {
             let style = if status.error {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -153,6 +128,64 @@ fn render_prompt_overlay(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(Clear, row);
     frame.render_widget(Paragraph::new(vec![line]), row);
+}
+
+/// One prompt row: a coloured badge, what is being asked, the buffer with a
+/// cursor, and a hint reading back what Enter will do.
+fn prompt_line(app: &App, kind: PromptKind, tube: &str, buf: &str) -> Line<'static> {
+    let (badge, badge_bg, ask) = match kind {
+        PromptKind::Pause => (" Pause ", Color::Yellow, "for"),
+        PromptKind::Kick => (" Kick ", Color::Cyan, "up to"),
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            badge,
+            Style::default().fg(Color::Black).bg(badge_bg).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" {tube} {ask}: ")),
+        Span::styled(
+            buf.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("\u{2588}", Style::default().fg(Color::DarkGray)),
+    ];
+
+    // The hint is the only feedback on bad input — Enter on something
+    // unparseable is a deliberate no-op, so this must say why.
+    let (hint, hint_style) = match kind {
+        PromptKind::Pause => match parse_duration(buf) {
+            Some(0) => ("  = unpause now".to_string(), Color::DarkGray),
+            Some(secs) => (format!("  = {}", format_secs(secs as u64)), Color::DarkGray),
+            None if buf.is_empty() => ("  seconds, or 5m / 2h".to_string(), Color::DarkGray),
+            None => ("  not a duration".to_string(), Color::Red),
+        },
+        // Read live from the snapshot rather than captured when the prompt
+        // opened: a poll can land mid-typing, and the plan should describe the
+        // tube as it is now, not as it was.
+        PromptKind::Kick => {
+            let (available, state) = app
+                .tube_by_name(tube)
+                .map(|t| kick_target(t.current_jobs_buried, t.current_jobs_delayed))
+                .unwrap_or((0, "buried"));
+            match parse_count(buf) {
+                Some(n) => (
+                    format!("  = {}", kick_plan(n, available, state)),
+                    Color::DarkGray,
+                ),
+                None if buf.is_empty() => {
+                    (format!("  how many, of {available} {state}"), Color::DarkGray)
+                }
+                None => ("  not a job count".to_string(), Color::Red),
+            }
+        }
+    };
+    spans.push(Span::styled(hint, Style::default().fg(hint_style)));
+    spans.push(Span::styled(
+        "   Enter confirm  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+    Line::from(spans)
 }
 
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -321,11 +354,31 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(p, area);
 }
 
+/// The chart title, and with it the key hints — the widest form that fits the
+/// frame. The full list no longer fits 80 columns alongside a hidden count, and
+/// letting ratatui chop it mid-word loses a whole key rather than the least
+/// important one, so drop hints deliberately instead: `u` and the toggle's
+/// wording go first, since a paused tube already wears a badge and `e` is
+/// discoverable from the "N hidden" count next to it.
+fn chart_title(scope: &str, toggle: &str, width: u16) -> String {
+    let arrows = "\u{2191}\u{2193}";
+    let candidates = [
+        format!(" Tubes ({scope}) {arrows} p:pause u:unpause K:kick s:sort {toggle} q:quit "),
+        format!(" Tubes ({scope}) {arrows} p:pause K:kick s:sort e:empty q:quit "),
+        format!(" Tubes ({scope}) {arrows} p K s e q "),
+        format!(" Tubes ({scope}) "),
+    ];
+    candidates
+        .iter()
+        .find(|t| t.chars().count() <= width as usize)
+        .unwrap_or(candidates.last().expect("candidates is non-empty"))
+        .clone()
+}
+
 fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeStats]) {
     // Key hints live in the title rather than the legend: the legend is nearly
     // 52 columns of colour swatches on its own and would push them off an
-    // 80-column terminal, where they are needed most. Kept tight enough that
-    // the whole title still fits in 80 columns with a count present.
+    // 80-column terminal, where they are needed most.
     //
     // Derived from the list rather than recounted, so the number can never
     // disagree with what was actually filtered out.
@@ -342,9 +395,9 @@ fn render_tube_chart(frame: &mut Frame, app: &App, area: Rect, tubes: &[&TubeSta
     } else {
         sort.to_string()
     };
-    let title =
-        format!(" Tubes ({scope}) \u{2191}\u{2193} p:pause u:unpause s:sort {toggle} q:quit ");
-    let block = Block::default().borders(Borders::BOTTOM).title(title);
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .title(chart_title(&scope, toggle, area.width));
 
     if app.current.is_none() {
         frame.render_widget(block, area);
@@ -837,6 +890,27 @@ mod tests {
     /// Rows the chart is left with, given the split.
     fn chart_rows(avail: usize, bottom: usize) -> usize {
         avail.saturating_sub(bottom).saturating_sub(CHART_OVERHEAD)
+    }
+
+    #[test]
+    fn the_title_never_overflows_the_frame() {
+        // The 80-column case is the one that matters: it is where the hints are
+        // needed most and where the full list no longer fits.
+        for width in 1..=120u16 {
+            for scope in ["name", "size \u{00b7} 11 hidden", "size \u{00b7} 1234 hidden"] {
+                let title = chart_title(scope, "e:show empty", width);
+                assert!(
+                    title.chars().count() <= width as usize || width < 30,
+                    "width {width} scope {scope:?} -> {title:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eighty_columns_still_offers_the_kick_hint() {
+        let title = chart_title("name \u{00b7} 11 hidden", "e:show empty", 80);
+        assert!(title.contains("K:kick"), "{title:?}");
     }
 
     #[test]

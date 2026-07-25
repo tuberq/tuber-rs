@@ -130,6 +130,7 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 | `↑` `↓` / `k` `j` | Move the tube cursor |
 | `p` | Pause the selected tube — prompts for a duration |
 | `u` | Unpause the selected tube immediately |
+| `K` | Kick the selected tube — prompts for how many jobs |
 | `s` | Cycle sort: by name (default), then by size |
 | `e` | Show/hide empty tubes (no jobs in any state) |
 | `q` | Quit |
@@ -137,6 +138,17 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 Empty tubes are hidden on startup, since most tubes on a busy server are empty
 most of the time. The title reports how many are out of view — ` Tubes (name ·
 11 hidden) ` — and `e` brings them back.
+
+Kick is `K` rather than `k`, which is already the vim-style cursor movement.
+A single `kick` moves buried jobs whenever the tube has any, and only falls
+through to delayed once there are none — one state per command, never both, so
+a bound larger than the buried count does *not* spill into the delayed jobs.
+The prompt therefore opens prefilled with everything one kick can move, and its
+hint names the state as well as the number — ` = 42 buried` — so it is clear
+which pile is about to move. Clearing a backlog is `K` then Enter; a smaller
+bound is a matter of typing over the prefill. A tube with neither buried nor
+delayed jobs refuses the prompt rather than opening one that could only report
+`kicked 0`.
 
 Pause durations are seconds by default, matching `tuber-cli pause --delay`.
 `m` and `h` suffixes scale from there, so `90`, `5m` and `2h` are all valid, and

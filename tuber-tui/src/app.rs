@@ -26,10 +26,24 @@ impl SortMode {
     }
 }
 
+/// What a prompt is collecting. The prompt machinery — buffer editing, Esc,
+/// Enter — is identical for both; only parsing and wording differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptKind {
+    /// A pause duration, parsed by [`parse_duration`].
+    Pause,
+    /// A kick bound, parsed by [`parse_count`].
+    Kick,
+}
+
 pub enum Mode {
     Normal,
-    /// Awaiting a pause duration for `tube`. `buf` is the raw keyed input.
-    PausePrompt { tube: String, buf: String },
+    /// Awaiting input for `tube`. `buf` is the raw keyed input.
+    Prompt {
+        kind: PromptKind,
+        tube: String,
+        buf: String,
+    },
 }
 
 pub struct Status {
@@ -192,14 +206,14 @@ impl App {
         self.selected = Some(next_name);
     }
 
+    /// A tube's stats from the latest snapshot.
+    pub fn tube_by_name(&self, name: &str) -> Option<&TubeStats> {
+        self.current.as_ref()?.tubes.iter().find(|t| t.name == name)
+    }
+
     /// The selected tube's stats, if the cursor is on one.
     pub fn selected_tube(&self) -> Option<&TubeStats> {
-        let name = self.selected.as_ref()?;
-        self.current
-            .as_ref()?
-            .tubes
-            .iter()
-            .find(|t| &t.name == name)
+        self.tube_by_name(self.selected.as_deref()?)
     }
 
     /// Calculate rate (per second) of a cumulative counter between snapshots.
@@ -275,6 +289,35 @@ pub fn parse_duration(input: &str) -> Option<u32> {
     n.checked_mul(multiplier)
 }
 
+/// Parse a kick bound: a plain count of jobs. Zero is rejected — `kick 0` is a
+/// no-op, and Enter on a prompt should always do something.
+pub fn parse_count(input: &str) -> Option<u32> {
+    let n: u32 = input.trim().parse().ok()?;
+    (n > 0).then_some(n)
+}
+
+/// What a single `kick` would act on: how many jobs, and which state they are
+/// in. The server kicks buried jobs whenever the tube has any and only falls
+/// through to delayed once there are none — one state per command, never both,
+/// so a bound past the buried count does *not* spill into the delayed jobs.
+/// This is therefore the ceiling on what any one kick can move.
+pub fn kick_target(buried: u64, delayed: u64) -> (u64, &'static str) {
+    match buried {
+        0 => (delayed, "delayed"),
+        buried => (buried, "buried"),
+    }
+}
+
+/// What `kick <bound>` will actually move: `12 buried`, `5 delayed`, or
+/// `nothing to kick`. The prompt's only feedback, and worth spelling out
+/// because the state being kicked is not something the bound alone tells you.
+pub fn kick_plan(bound: u32, available: u64, state: &str) -> String {
+    match available.min(bound as u64) {
+        0 => "nothing to kick".to_string(),
+        n => format!("{n} {state}"),
+    }
+}
+
 /// Compact duration for the pause badge: `45s`, `12m`, `2h5m`.
 pub fn format_secs(secs: u64) -> String {
     if secs < 60 {
@@ -344,6 +387,46 @@ mod tests {
         assert_eq!(format_secs(3916), "1h6m");
         // Carrying into the next hour must not produce "1h60m".
         assert_eq!(format_secs(7150), "2h");
+    }
+
+    #[test]
+    fn counts_are_positive_integers() {
+        assert_eq!(parse_count("1"), Some(1));
+        assert_eq!(parse_count(" 250 "), Some(250));
+        // Unlike a pause duration, 0 does nothing at all.
+        assert_eq!(parse_count("0"), None);
+        assert_eq!(parse_count(""), None);
+        assert_eq!(parse_count("-1"), None);
+        assert_eq!(parse_count("5m"), None);
+        assert_eq!(parse_count("1.5"), None);
+    }
+
+    /// Verified against tuber 0.13.0: a tube with 3 buried and 5 delayed given
+    /// `kick 5` replies `KICKED 3`. The bound does not spill into the delayed
+    /// jobs, so neither may the plan.
+    #[test]
+    fn kick_targets_buried_while_any_remain() {
+        assert_eq!(kick_target(42, 3), (42, "buried"));
+        assert_eq!(kick_target(0, 3), (3, "delayed"));
+        assert_eq!(kick_target(0, 0), (0, "delayed"));
+    }
+
+    #[test]
+    fn kick_plan_reports_the_state_it_will_move() {
+        let (avail, state) = kick_target(42, 3);
+        assert_eq!(kick_plan(5, avail, state), "5 buried");
+        assert_eq!(kick_plan(42, avail, state), "42 buried");
+        // A bound past the buried count still only kicks the buried jobs.
+        assert_eq!(kick_plan(1000, avail, state), "42 buried");
+
+        let (avail, state) = kick_target(0, 10);
+        assert_eq!(kick_plan(7, avail, state), "7 delayed");
+    }
+
+    #[test]
+    fn kick_plan_says_so_when_there_is_nothing_to_do() {
+        let (avail, state) = kick_target(0, 0);
+        assert_eq!(kick_plan(u32::MAX, avail, state), "nothing to kick");
     }
 
     #[test]
