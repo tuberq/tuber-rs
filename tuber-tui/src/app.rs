@@ -60,7 +60,10 @@ impl App {
             selected: None,
             sort: SortMode::Name,
             mode: Mode::Normal,
-            hide_empty: false,
+            // Empty tubes are hidden by default: on a real server most tubes
+            // are empty most of the time, and they crowd out the ones doing
+            // work. Paused tubes stay visible even at zero — see is_empty.
+            hide_empty: true,
             status: None,
         }
     }

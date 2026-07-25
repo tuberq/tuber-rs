@@ -134,6 +134,10 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 | `e` | Show/hide empty tubes (no jobs in any state) |
 | `q` | Quit |
 
+Empty tubes are hidden on startup, since most tubes on a busy server are empty
+most of the time. The title reports how many are out of view — ` Tubes (name ·
+11 hidden) ` — and `e` brings them back.
+
 Pause durations are seconds by default, matching `tuber-cli pause --delay`.
 `m` and `h` suffixes scale from there, so `90`, `5m` and `2h` are all valid, and
 `0` unpauses. A paused tube carries a `PAUSED 12m` badge showing the time left,
