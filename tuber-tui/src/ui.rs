@@ -73,9 +73,14 @@ const PAUSE_RESERVE: usize = 12;
 /// The long name is here rather than in a parallel array because the two are
 /// only ever indexed together: the chart's headers are abbreviated to fit a
 /// six-column field, and the detail pane's running text is not.
+///
+/// Urgent is the one colour spelled out in RGB: there is no ANSI orange, and it
+/// has to sit between ready's green and reserved's yellow without reading as
+/// either. Darker than a plain orange so it survives a light background — full
+/// #FFA500 on white is about a 2:1 contrast, which the header line loses.
 const STATES: [(&str, &str, Color); 5] = [
     ("ready", "ready", Color::Green),
-    ("urgnt", "urgent", Color::Rgb(255, 165, 0)),
+    ("urgnt", "urgent", Color::Rgb(217, 119, 6)),
     ("resvd", "reserved", Color::Yellow),
     ("delay", "delayed", Color::Blue),
     ("buried", "buried", Color::Red),
@@ -271,9 +276,11 @@ fn prompt_line(app: &App, kind: PromptKind, tube: &str, buf: &str) -> Line<'stat
             Style::default().fg(Color::Black).bg(badge_bg).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" {tube} {ask}: ")),
+        // Reset, not White: what you have typed has to be the most legible thing
+        // on the line, and White is invisible on a light terminal.
         Span::styled(
             buf.to_string(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Reset).add_modifier(Modifier::BOLD),
         ),
         Span::styled("\u{2588}", Style::default().fg(Color::DarkGray)),
     ];
