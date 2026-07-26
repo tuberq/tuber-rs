@@ -112,11 +112,6 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      # fetch-tags is what brings the annotated tag *object* along. It defaults
-      # to false and checkout passes --no-tags even at fetch-depth: 0, so
-      # without it the workspace has the tag's ref pointing at the commit but
-      # not its message — and %(contents) then falls back to the commit's,
-      # which is how v0.14.0 came to be published with the wrong notes.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -126,6 +121,17 @@ jobs:
         with:
           pattern: tuber-*
           merge-multiple: true
+
+      # fetch-tags on checkout is not enough, which cost v0.14.1 its release.
+      # Checkout resolves a tag push to its commit SHA and writes
+      # refs/tags/<name> pointing straight at that commit, so the ref exists
+      # before any tag fetch runs — and fetch will not clobber an existing ref.
+      # Every *other* tag arrives as its real object and this one, the only one
+      # we need, stays lightweight. An explicit refspec with --force replaces
+      # it; `t [tag update]` in the log is the fix doing its job.
+      - name: Fetch the tag object itself
+        if: startsWith(github.ref, 'refs/tags/')
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
 
       # generate_release_notes builds its summary from merged pull requests, and
       # this repository commits straight to main — so it had nothing to
