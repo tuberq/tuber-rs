@@ -1,6 +1,6 @@
 use crate::app::{
-    format_secs, kick_plan, kick_target, parse_count, parse_duration, plural, App, Mode,
-    PromptKind, Selection,
+    flush_plan, format_secs, kick_plan, kick_target, parse_count, parse_duration, parse_scope,
+    plural, App, Mode, PromptKind, Selection,
 };
 use tuber_lib::model::{ServerStats, TubeStats};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -268,6 +268,9 @@ fn prompt_line(app: &App, kind: PromptKind, tube: &str, buf: &str) -> Line<'stat
     let (badge, badge_bg, ask) = match kind {
         PromptKind::Pause => (" Pause ", Color::Yellow, "for"),
         PromptKind::Kick => (" Kick ", Color::Cyan, "up to"),
+        // Red, alone among the three: this is the one prompt whose Enter
+        // destroys jobs, and there is no undo for it.
+        PromptKind::Flush => (" Flush ", Color::Red, "delete"),
     };
 
     let mut spans = vec![
@@ -313,6 +316,16 @@ fn prompt_line(app: &App, kind: PromptKind, tube: &str, buf: &str) -> Line<'stat
                 None => ("  not a job count".to_string(), Color::Red),
             }
         }
+        // Live from the snapshot for the same reason as kick, and doubly worth
+        // it here: the reserved count in the `all` plan is what says workers
+        // are about to lose jobs mid-run.
+        PromptKind::Flush => match (parse_scope(buf), app.tube_by_name(tube)) {
+            (Some(scope), Some(t)) => (format!("  = {}", flush_plan(scope, t)), Color::DarkGray),
+            // The tube went away under the prompt; Enter is a no-op too.
+            (Some(_), None) => ("  = nothing to delete".to_string(), Color::DarkGray),
+            (None, _) if buf.is_empty() => ("  buried or all".to_string(), Color::DarkGray),
+            (None, _) => ("  not a scope".to_string(), Color::Red),
+        },
     };
     spans.push(Span::styled(hint, Style::default().fg(hint_style)));
     spans.push(Span::styled(
@@ -452,9 +465,11 @@ fn labelled(label: &str, value: String, colour: Color) -> Vec<Span<'static>> {
 fn chart_title(scope: &str, toggle: &str, width: u16) -> String {
     let arrows = "\u{2191}\u{2193}";
     let candidates = [
-        format!(" Tubes ({scope}) {arrows} p:pause u:unpause K:kick s:sort {toggle} q:quit "),
-        format!(" Tubes ({scope}) {arrows} p:pause K:kick s:sort e:empty q:quit "),
-        format!(" Tubes ({scope}) {arrows} p K s e q "),
+        format!(
+            " Tubes ({scope}) {arrows} p:pause u:unpause K:kick f:flush s:sort {toggle} q:quit "
+        ),
+        format!(" Tubes ({scope}) {arrows} p:pause K:kick f:flush s:sort e:empty q:quit "),
+        format!(" Tubes ({scope}) {arrows} p K f s e q "),
         format!(" Tubes ({scope}) "),
     ];
     // The shortest form is the fallback, so there is always an answer.
@@ -1668,6 +1683,12 @@ mod tests {
     }
 
     #[test]
+    fn eighty_columns_still_offers_the_flush_hint() {
+        let title = chart_title("name \u{00b7} 11 hidden", "e:show empty", 80);
+        assert!(title.contains("f:flush"), "{title:?}");
+    }
+
+    #[test]
     fn tall_terminal_fits_everything() {
         // 50-row terminal, 5-row top bar: 19 tubes, 6 with timing data.
         let (bottom, rows) = split_bottom(45, 19, 6);
@@ -1909,6 +1930,29 @@ mod tests {
         let mut app = sample_app(tubes);
         app.selected = Some(Selection::Tube(selected.to_string()));
         app
+    }
+
+    #[test]
+    fn the_flush_prompt_reads_back_what_enter_deletes() {
+        let mut app = app_with_selection(vec![rich_tube()], "covers");
+        // covers: 1600000 ready, 0 reserved, 124 delayed, 23 buried.
+        for (buf, expected) in [
+            ("bu", "= delete 23 buried"),
+            ("all", "= delete 1600147 jobs"),
+            ("", "buried or all"),
+            ("x", "not a scope"),
+        ] {
+            app.mode = Mode::Prompt {
+                kind: PromptKind::Flush,
+                tube: "covers".to_string(),
+                buf: buf.to_string(),
+            };
+            let frame = draw_frame(&app, 130, 24).join("\n");
+            assert!(
+                frame.contains(expected),
+                "buffer {buf:?} should read back {expected:?}:\n{frame}"
+            );
+        }
     }
 
     /// The content of a detail-pane line, found by its label. `None` when the

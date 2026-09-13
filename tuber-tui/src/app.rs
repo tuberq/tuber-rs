@@ -27,13 +27,15 @@ impl SortMode {
 }
 
 /// What a prompt is collecting. The prompt machinery — buffer editing, Esc,
-/// Enter — is identical for both; only parsing and wording differ.
+/// Enter — is identical for all of them; only parsing and wording differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptKind {
     /// A pause duration, parsed by [`parse_duration`].
     Pause,
     /// A kick bound, parsed by [`parse_count`].
     Kick,
+    /// A flush scope, parsed by [`parse_scope`].
+    Flush,
 }
 
 pub enum Mode {
@@ -370,6 +372,62 @@ pub fn kick_plan(bound: u32, available: u64, state: &str) -> String {
     }
 }
 
+/// Which jobs a flush throws away: only the buried ones (`flush-buried`), or
+/// every job in the tube (`flush-tube`, which takes reserved jobs too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushScope {
+    Buried,
+    All,
+}
+
+/// Parse a flush scope: `buried` or `all`, case-insensitive, and any prefix of
+/// either — they differ at the first letter, so `b` and `a` are unambiguous.
+/// The empty buffer is rejected before the prefix test, which would otherwise
+/// match it against both.
+pub fn parse_scope(input: &str) -> Option<FlushScope> {
+    let s = input.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    if "buried".starts_with(&s) {
+        return Some(FlushScope::Buried);
+    }
+    if "all".starts_with(&s) {
+        return Some(FlushScope::All);
+    }
+    None
+}
+
+/// How many jobs a flush of `scope` would delete right now. The one count that
+/// opening the prompt, the hint and Enter all read, so they cannot disagree.
+pub fn flush_target(scope: FlushScope, tube: &TubeStats) -> u64 {
+    match scope {
+        FlushScope::Buried => tube.current_jobs_buried,
+        FlushScope::All => tube.current_total(),
+    }
+}
+
+/// What Enter will delete: `delete 23 buried`, `delete 1943 jobs (12 reserved)`
+/// or `nothing to delete`. Reserved jobs are called out for `all` because
+/// flushing takes them out from under a worker that is still running them —
+/// the one consequence of this command that the total alone does not show.
+pub fn flush_plan(scope: FlushScope, tube: &TubeStats) -> String {
+    let n = flush_target(scope, tube);
+    if n == 0 {
+        return "nothing to delete".to_string();
+    }
+    match scope {
+        FlushScope::Buried => format!("delete {n} buried"),
+        FlushScope::All => {
+            let jobs = format!("delete {n} job{}", plural(n as usize));
+            match tube.current_jobs_reserved {
+                0 => jobs,
+                reserved => format!("{jobs} ({reserved} reserved)"),
+            }
+        }
+    }
+}
+
 /// Pluralising suffix for a count. Here rather than in `ui.rs` so the command
 /// results in `main.rs` can reach it too.
 pub fn plural(n: usize) -> &'static str {
@@ -393,6 +451,34 @@ pub fn format_secs(secs: u64) -> String {
         } else {
             format!("{hours}h{rem}m")
         }
+    }
+}
+
+/// Fixtures shared by the unit tests in this crate's other modules. `ui.rs`
+/// keeps its own richer tubes; these are the minimum a key handler needs.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use tuber_lib::model::ServerStats;
+
+    pub fn tube(name: &str, ready: u64, reserved: u64, delayed: u64, buried: u64) -> TubeStats {
+        TubeStats::from_yaml(&format!(
+            "name: {name}\n\
+             current-jobs-ready: {ready}\n\
+             current-jobs-reserved: {reserved}\n\
+             current-jobs-delayed: {delayed}\n\
+             current-jobs-buried: {buried}\n",
+        ))
+    }
+
+    pub fn app_with(tubes: Vec<TubeStats>) -> App {
+        let mut app = App::new("test:11300".to_string());
+        app.update(Snapshot {
+            server: ServerStats::from_yaml("version: tuber 0.14.2\n"),
+            tubes,
+            fetched_at: Instant::now(),
+        });
+        app
     }
 }
 
@@ -485,6 +571,71 @@ mod tests {
     fn kick_plan_says_so_when_there_is_nothing_to_do() {
         let (avail, state) = kick_target(0, 0);
         assert_eq!(kick_plan(u32::MAX, avail, state), "nothing to kick");
+    }
+
+    #[test]
+    fn scopes_accept_unambiguous_prefixes() {
+        assert_eq!(parse_scope("buried"), Some(FlushScope::Buried));
+        assert_eq!(parse_scope("b"), Some(FlushScope::Buried));
+        assert_eq!(parse_scope("BU"), Some(FlushScope::Buried));
+        assert_eq!(parse_scope(" buried "), Some(FlushScope::Buried));
+        assert_eq!(parse_scope("all"), Some(FlushScope::All));
+        assert_eq!(parse_scope("a"), Some(FlushScope::All));
+        assert_eq!(parse_scope("Al"), Some(FlushScope::All));
+    }
+
+    #[test]
+    fn scopes_reject_anything_else() {
+        // `"buried".starts_with("")` is true, so the empty buffer has to be
+        // turned away before the prefix test runs.
+        assert_eq!(parse_scope(""), None);
+        assert_eq!(parse_scope("   "), None);
+        assert_eq!(parse_scope("x"), None);
+        assert_eq!(parse_scope("buriedx"), None);
+        assert_eq!(parse_scope("ball"), None);
+    }
+
+    #[test]
+    fn flush_target_counts_what_the_scope_deletes() {
+        let tube = test_support::tube("q", 5, 12, 3, 23);
+        assert_eq!(flush_target(FlushScope::Buried, &tube), 23);
+        // Every state, reserved included.
+        assert_eq!(flush_target(FlushScope::All, &tube), 43);
+    }
+
+    #[test]
+    fn flush_plan_names_the_pile_it_deletes() {
+        let tube = test_support::tube("q", 1908, 12, 0, 23);
+        assert_eq!(flush_plan(FlushScope::Buried, &tube), "delete 23 buried");
+        // Reserved is called out because flushing pulls those jobs out from
+        // under a worker that is still running them.
+        assert_eq!(
+            flush_plan(FlushScope::All, &tube),
+            "delete 1943 jobs (12 reserved)"
+        );
+    }
+
+    #[test]
+    fn flush_plan_mentions_reserved_only_when_there_are_some() {
+        assert_eq!(
+            flush_plan(FlushScope::All, &test_support::tube("q", 4, 0, 0, 0)),
+            "delete 4 jobs"
+        );
+        assert_eq!(
+            flush_plan(FlushScope::All, &test_support::tube("q", 1, 0, 0, 0)),
+            "delete 1 job"
+        );
+    }
+
+    #[test]
+    fn flush_plan_says_so_when_there_is_nothing_to_delete() {
+        let ready_only = test_support::tube("q", 5, 0, 0, 0);
+        assert_eq!(
+            flush_plan(FlushScope::Buried, &ready_only),
+            "nothing to delete"
+        );
+        let empty = test_support::tube("q", 0, 0, 0, 0);
+        assert_eq!(flush_plan(FlushScope::All, &empty), "nothing to delete");
     }
 
     #[test]

@@ -1,7 +1,10 @@
 mod app;
 mod ui;
 
-use app::{format_secs, kick_target, parse_count, parse_duration, plural, App, Mode, PromptKind};
+use app::{
+    flush_target, format_secs, kick_target, parse_count, parse_duration, parse_scope, plural, App,
+    FlushScope, Mode, PromptKind,
+};
 use clap::Parser;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -33,22 +36,27 @@ enum PollMsg {
 }
 
 /// A server command a keypress asked for.
+#[derive(Debug, PartialEq, Eq)]
 enum Command {
     Pause { tube: String, delay: u32 },
     Kick { tube: String, bound: u32 },
+    Flush { tube: String, scope: FlushScope },
 }
 
 impl Command {
     /// The tube the command acts on, for error reporting.
     fn tube(&self) -> &str {
         match self {
-            Command::Pause { tube, .. } | Command::Kick { tube, .. } => tube,
+            Command::Pause { tube, .. }
+            | Command::Kick { tube, .. }
+            | Command::Flush { tube, .. } => tube,
         }
     }
 }
 
 /// What a keypress asked for. Commands are returned rather than issued inline
 /// so key handling stays synchronous and testable.
+#[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
     Quit,
@@ -59,7 +67,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     // The prompt swallows everything, including `q` — otherwise typing a
     // duration could quit the app.
     if matches!(app.mode, Mode::Prompt { .. }) {
-        return handle_prompt_key(&mut app.mode, key);
+        return handle_prompt_key(app, key);
     }
 
     match key.code {
@@ -87,6 +95,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         // Shift-K: lowercase `k` is the vim-style cursor movement above.
         KeyCode::Char('K') => {
             open_prompt(app, PromptKind::Kick);
+            Action::None
+        }
+        KeyCode::Char('f') => {
+            open_prompt(app, PromptKind::Flush);
             Action::None
         }
         KeyCode::Char('u') => {
@@ -123,13 +135,16 @@ fn no_tube_reason(app: &App) -> String {
 
 /// Open a prompt against the selected tube, refusing early when there is
 /// nothing for it to do — a kick prompt on a tube with no buried or delayed
-/// jobs can only ever report "kicked 0".
+/// jobs can only ever report "kicked 0", and a flush prompt on an empty tube
+/// has nothing to delete in either scope.
 fn open_prompt(app: &mut App, kind: PromptKind) {
     let Some(tube) = app.selected_tube() else {
         app.set_status(no_tube_reason(app), true);
         return;
     };
     let (available, _) = kick_target(tube.current_jobs_buried, tube.current_jobs_delayed);
+    // Read before the shadow below ends the borrow of the snapshot.
+    let total = tube.current_total();
     let tube = tube.name.clone();
 
     // One match owns what each kind does, so the refusal and the prefill — both
@@ -143,35 +158,37 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             return;
         }
         PromptKind::Kick => available.to_string(),
+        PromptKind::Flush if total == 0 => {
+            app.set_status(format!("{tube} is empty"), false);
+            return;
+        }
+        // No prefill, deliberately: typing the scope word is the act of
+        // consent for a command with no undo. A tube with jobs but none
+        // buried still opens, since `all` may be what is wanted.
+        PromptKind::Flush => String::new(),
     };
     app.mode = Mode::Prompt { kind, tube, buf };
 }
 
-/// Takes the mode by reference and destructures once, so the buffer being read
-/// on Enter is the same one the character keys wrote to.
-fn handle_prompt_key(mode: &mut Mode, key: KeyEvent) -> Action {
-    let Mode::Prompt { kind, tube, buf } = mode else {
+/// Destructures the mode once, so the buffer being read on Enter is the same
+/// one the character keys wrote to. Takes the whole `App` because a flush reads
+/// the live snapshot to decide whether Enter has anything to act on.
+fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Action {
+    let Mode::Prompt { kind, tube, buf } = &mut app.mode else {
         return Action::None;
     };
     match key.code {
         KeyCode::Esc => {
-            *mode = Mode::Normal;
+            app.mode = Mode::Normal;
             Action::None
         }
         KeyCode::Enter => {
-            let command = match kind {
-                PromptKind::Pause => parse_duration(buf).map(|delay| Command::Pause {
-                    tube: tube.clone(),
-                    delay,
-                }),
-                PromptKind::Kick => parse_count(buf).map(|bound| Command::Kick {
-                    tube: tube.clone(),
-                    bound,
-                }),
-            };
-            match command {
+            // Copied out so the borrow of `app.mode` ends before the snapshot
+            // is read.
+            let (kind, tube, buf) = (*kind, tube.clone(), buf.clone());
+            match prompt_command(kind, &tube, &buf, app.tube_by_name(&tube)) {
                 Some(command) => {
-                    *mode = Mode::Normal;
+                    app.mode = Mode::Normal;
                     Action::Run(command)
                 }
                 // No status message: it would linger after Esc, and the prompt
@@ -188,6 +205,30 @@ fn handle_prompt_key(mode: &mut Mode, key: KeyEvent) -> Action {
             Action::None
         }
         _ => Action::None,
+    }
+}
+
+/// What Enter on a prompt asks the server to do, or `None` when it would ask
+/// for nothing — bad input, or a command whose count is already zero. `stats`
+/// is the prompt's tube in the latest snapshot, `None` once it has vanished.
+///
+/// Every kind refuses a no-op, the rule `parse_count` already encodes for kick:
+/// Enter on a prompt should always do something, and the hint on screen has
+/// said `= nothing to delete` all along.
+fn prompt_command(
+    kind: PromptKind,
+    tube: &str,
+    buf: &str,
+    stats: Option<&tuber_lib::model::TubeStats>,
+) -> Option<Command> {
+    let tube = tube.to_string();
+    match kind {
+        PromptKind::Pause => parse_duration(buf).map(|delay| Command::Pause { tube, delay }),
+        PromptKind::Kick => parse_count(buf).map(|bound| Command::Kick { tube, bound }),
+        PromptKind::Flush => {
+            let scope = parse_scope(buf)?;
+            (flush_target(scope, stats?) > 0).then_some(Command::Flush { tube, scope })
+        }
     }
 }
 
@@ -210,6 +251,19 @@ async fn run_command(client: &mut TuberClient, command: &Command) -> io::Result<
             Ok(format!(
                 "{tube}: kicked {kicked} job{}",
                 plural(kicked as usize)
+            ))
+        }
+        // Both flushes name their tube in the command, so neither needs a
+        // `use`. A server without the extension answers UNKNOWN_COMMAND, which
+        // the client raises as an error and `spawn_command` shows in red.
+        Command::Flush { tube, scope } => {
+            let (flushed, what) = match scope {
+                FlushScope::Buried => (client.flush_buried(tube).await?, "buried "),
+                FlushScope::All => (client.flush_tube(tube).await?, ""),
+            };
+            Ok(format!(
+                "{tube}: flushed {flushed} {what}job{}",
+                plural(flushed as usize)
             ))
         }
     }
@@ -329,4 +383,131 @@ async fn main() -> anyhow::Result<()> {
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::test_support::{app_with, tube};
+    use app::{FlushScope, Selection};
+    use crossterm::event::KeyModifiers;
+
+    /// A plain press. `handle_key` is only ever reached for `KeyEventKind::Press`
+    /// — the filter is in the select loop — so the default kind is right here.
+    fn press(app: &mut App, code: KeyCode) -> Action {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Type a buffer into an open prompt, one character at a time.
+    fn type_in(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// The open prompt's kind, tube and buffer. `None` in Normal mode.
+    fn prompt(app: &App) -> Option<(PromptKind, String, String)> {
+        match &app.mode {
+            Mode::Prompt { kind, tube, buf } => Some((*kind, tube.clone(), buf.clone())),
+            Mode::Normal => None,
+        }
+    }
+
+    fn status(app: &App) -> (String, bool) {
+        let s = app.status.as_ref().expect("a status was set");
+        (s.msg.clone(), s.error)
+    }
+
+    /// A tube holding work in every state, with the cursor on it.
+    fn app_on_tube() -> App {
+        let mut app = app_with(vec![tube("q", 5, 12, 3, 23)]);
+        app.selected = Some(Selection::Tube("q".to_string()));
+        app
+    }
+
+    #[test]
+    fn flush_refuses_the_server_row() {
+        let mut app = app_on_tube();
+        app.selected = Some(Selection::Server);
+        assert_eq!(press(&mut app, KeyCode::Char('f')), Action::None);
+        assert!(prompt(&app).is_none(), "no prompt on the server row");
+        assert!(status(&app).1, "the refusal is an error");
+    }
+
+    #[test]
+    fn flush_refuses_a_tube_with_no_jobs() {
+        let mut app = app_with(vec![tube("q", 0, 0, 0, 0)]);
+        app.selected = Some(Selection::Tube("q".to_string()));
+        assert_eq!(press(&mut app, KeyCode::Char('f')), Action::None);
+        assert!(prompt(&app).is_none());
+        // Not an error: the key worked, there is simply nothing to delete.
+        assert_eq!(status(&app), ("q is empty".to_string(), false));
+    }
+
+    #[test]
+    fn flush_opens_an_empty_prompt() {
+        let mut app = app_on_tube();
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(
+            prompt(&app),
+            Some((PromptKind::Flush, "q".to_string(), String::new())),
+            "the scope word is the deliberate act, so nothing is prefilled"
+        );
+    }
+
+    #[test]
+    fn typing_all_flushes_the_whole_tube() {
+        let mut app = app_on_tube();
+        press(&mut app, KeyCode::Char('f'));
+        type_in(&mut app, "all");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Action::Run(Command::Flush {
+                tube: "q".to_string(),
+                scope: FlushScope::All,
+            })
+        );
+        assert!(prompt(&app).is_none(), "the prompt closes on a command");
+    }
+
+    #[test]
+    fn a_bare_b_flushes_the_buried_jobs() {
+        let mut app = app_on_tube();
+        press(&mut app, KeyCode::Char('f'));
+        type_in(&mut app, "b");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Action::Run(Command::Flush {
+                tube: "q".to_string(),
+                scope: FlushScope::Buried,
+            })
+        );
+    }
+
+    #[test]
+    fn enter_does_nothing_until_the_scope_names_jobs_that_exist() {
+        // A tube with jobs but none buried still opens the prompt, since `all`
+        // may be what is wanted — but `buried` there can only report 0.
+        let mut app = app_with(vec![tube("q", 5, 0, 3, 0)]);
+        app.selected = Some(Selection::Tube("q".to_string()));
+
+        for buf in ["", "x", "b"] {
+            press(&mut app, KeyCode::Char('f'));
+            type_in(&mut app, buf);
+            assert_eq!(press(&mut app, KeyCode::Enter), Action::None, "buf {buf:?}");
+            assert!(
+                prompt(&app).is_some(),
+                "the prompt stays open on {buf:?} so it can be corrected"
+            );
+            press(&mut app, KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn esc_closes_the_flush_prompt() {
+        let mut app = app_on_tube();
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
+        assert!(prompt(&app).is_none());
+    }
 }

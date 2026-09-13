@@ -142,6 +142,7 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 | `p` | Pause the selected tube — prompts for a duration |
 | `u` | Unpause the selected tube immediately |
 | `K` | Kick the selected tube — prompts for how many jobs |
+| `f` | Flush the selected tube — prompts for `buried` or `all` |
 | `s` | Cycle sort: by name (default), then by size |
 | `e` | Show/hide empty tubes (no jobs in any state) |
 | `q` | Quit |
@@ -160,6 +161,17 @@ which pile is about to move. Clearing a backlog is `K` then Enter; a smaller
 bound is a matter of typing over the prefill. A tube with neither buried nor
 delayed jobs refuses the prompt rather than opening one that could only report
 `kicked 0`.
+
+Flush is the counterpart: `K` retries a backlog, `f` throws it away. The prompt
+opens *empty*, unlike kick's prefill — typing the scope word is the deliberate
+act, because the server only ever answers `FLUSHED <n>` and there is no undo.
+`buried` deletes only the buried jobs; `all` deletes every job in the tube,
+including ones a worker currently holds reserved, and ignores a pause. Prefixes
+are enough, so `b` and `a` do. The hint reads the plan back from the live
+snapshot — ` = delete 23 buried`, ` = delete 1943 jobs (12 reserved)` — so the
+reserved count is in front of you before Enter. A scope with nothing in it
+shows ` = nothing to delete` and Enter does nothing; a tube with no jobs at all
+refuses the prompt.
 
 Pause durations are seconds by default, matching `tuber-cli pause --delay`.
 `m` and `h` suffixes scale from there, so `90`, `5m` and `2h` are all valid, and
