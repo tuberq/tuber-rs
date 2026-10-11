@@ -70,16 +70,21 @@ tuber-cli stats --format text
 ```
 
 Note that a reservation belongs to the connection that made it, and each
-`tuber-cli` run is a new connection. So `reserve` then `bury` as two commands
-won't work — the reserve is dropped on exit. Use `tuber-lib` (or one `nc`
-session) to reserve and finish a job together; see `skill/SKILL.md`.
+`tuber-cli` run is a new connection. The reservation is released the moment
+the process exits, which is why there is no `tuber-cli bury`, `release` or
+`touch` — nothing can follow `reserve` to finish the job. Use `tuber-lib` (or
+one `nc` session) to reserve and finish a job together; see `skill/SKILL.md`.
 
 ### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `-a, --addr` | `$TUBER_ADDR` or `localhost:11300` | Server address |
+| `-a, --addr` | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address: `host:port`, `host`, or `:port` |
 | `-f, --format` | `json` | Output format: `json` or `text` |
+
+`TUBER_URL` is the same variable the Ruby gem reads, so one setting points every
+client at the same server. Despite the name it takes a bare address, not a URL.
+`TUBER_ADDR`, the name tuber-cli and tuber-tui used before, still works.
 
 ## tuber-tui
 
@@ -123,7 +128,7 @@ cargo install --path tuber-tui
 ### Usage
 
 ```bash
-tuber-tui                        # connects to TUBER_TUI or localhost:11300
+tuber-tui                        # connects to $TUBER_URL or localhost:11300
 tuber-tui staging.example.com    # custom host
 tuber-tui :11301                 # custom port
 tuber-tui -i 0.5                 # faster polling (0.5s)
@@ -131,7 +136,7 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 
 | Option | Default | Description |
 |---|---|---|
-| `[HOST]` positional | `$TUBER_ADDR` or `localhost:11300` | Server address |
+| `[HOST]` positional | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address (same lookup as tuber-cli) |
 | `-i, --interval` | `1.5` | Poll interval (seconds) |
 
 ### Keys

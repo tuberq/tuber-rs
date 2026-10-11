@@ -20,8 +20,9 @@ use tuber_lib::model::Snapshot;
 #[derive(Parser)]
 #[command(name = "tuber-tui", version, about = "TUI dashboard for tuber job queue")]
 struct Cli {
-    /// Server address [host][:port] (default: localhost:11300)
-    #[arg(value_name = "HOST", env = "TUBER_ADDR")]
+    /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
+    /// $BEANSTALKD_URL, then localhost:11300]
+    #[arg(value_name = "HOST")]
     addr: Option<String>,
 
     /// Poll interval in seconds
@@ -302,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
 
     let (tx, mut rx) = mpsc::channel::<PollMsg>(4);
-    let addr = tuber_lib::resolve_addr(cli.addr.as_deref());
+    let addr = tuber_lib::server_addr(cli.addr.as_deref());
     let interval = Duration::from_secs_f64(cli.interval);
 
     // Kept for command dispatch and for display; the poller takes its own copies.

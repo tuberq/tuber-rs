@@ -89,7 +89,8 @@ impl Selection {
 }
 
 pub struct App {
-    /// The address we dialled, as resolved from the argument or `TUBER_ADDR`.
+    /// The address we dialled, as resolved from the argument or the address
+    /// env vars (`tuber_lib::ADDR_ENV_VARS`).
     ///
     /// Worth holding because it is the only identity of the server the *client*
     /// is sure of: `stats` reports the server's own `hostname`, which inside a

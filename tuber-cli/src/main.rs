@@ -1,12 +1,13 @@
 use clap::{Parser, Subcommand};
-use std::io::Read;
+use std::io::{Read, Write};
 use tuber_lib::client::TuberClient;
 
 #[derive(Parser)]
 #[command(name = "tuber-cli", version, about = "CLI for tuber/beanstalkd job queue")]
 struct Cli {
-    /// Server address [host][:port] (default: localhost:11300)
-    #[arg(short, long, global = true, value_name = "ADDR", env = "TUBER_ADDR")]
+    /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
+    /// $BEANSTALKD_URL, then localhost:11300]
+    #[arg(short, long, global = true, value_name = "ADDR")]
     addr: Option<String>,
 
     /// Output format
@@ -199,16 +200,6 @@ enum Command {
         ids: Vec<u64>,
     },
 
-    /// Bury a reserved job
-    Bury {
-        /// Job ID
-        id: u64,
-
-        /// Priority for the buried job
-        #[arg(long, default_value = "0")]
-        priority: u32,
-    },
-
     /// Pause a tube for a number of seconds
     Pause {
         /// Tube name
@@ -223,7 +214,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let addr = tuber_lib::resolve_addr(cli.addr.as_deref());
+    let addr = tuber_lib::server_addr(cli.addr.as_deref());
     let mut client = TuberClient::connect(&addr).await?;
 
     match cli.command {
@@ -392,11 +383,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Bury { id, priority } => {
-            client.bury(id, priority).await?;
-            output(&cli.format, &serde_json::json!({ "status": "buried", "id": id }))?;
-        }
-
         Command::Pause { tube, delay } => {
             client.pause_tube(&tube, delay).await?;
             output(&cli.format, &serde_json::json!({ "status": "paused", "tube": tube, "delay": delay }))?;
@@ -407,30 +393,40 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn output(format: &OutputFormat, value: &impl serde::Serialize) -> anyhow::Result<()> {
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(value)?);
-        }
+    let mut out = std::io::stdout().lock();
+    let written = match format {
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(value)?),
         OutputFormat::Text => {
             // Render as compact JSON for text mode — structured types get pretty-printed
             let v = serde_json::to_value(value)?;
-            print_text(&v, 0);
+            print_text(&mut out, &v, 0)
         }
     }
-    Ok(())
+    .and_then(|()| out.flush());
+    match written {
+        // The reader went away (`tuber-cli … | head`). The command itself has
+        // already run, so this ends the output, not the command: callers like
+        // delete-batch still choose the exit status.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
 }
 
-fn print_text(value: &serde_json::Value, indent: usize) {
+fn print_text(
+    out: &mut impl Write,
+    value: &serde_json::Value,
+    indent: usize,
+) -> std::io::Result<()> {
     let pad = " ".repeat(indent);
     match value {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
                 match v {
                     serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        println!("{pad}{k}:");
-                        print_text(v, indent + 2);
+                        writeln!(out, "{pad}{k}:")?;
+                        print_text(out, v, indent + 2)?;
                     }
-                    _ => println!("{pad}{k}: {}", format_value(v)),
+                    _ => writeln!(out, "{pad}{k}: {}", format_value(v))?,
                 }
             }
         }
@@ -438,15 +434,16 @@ fn print_text(value: &serde_json::Value, indent: usize) {
             for item in arr {
                 match item {
                     serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        println!("{pad}-");
-                        print_text(item, indent + 2);
+                        writeln!(out, "{pad}-")?;
+                        print_text(out, item, indent + 2)?;
                     }
-                    _ => println!("{pad}- {}", format_value(item)),
+                    _ => writeln!(out, "{pad}- {}", format_value(item))?,
                 }
             }
         }
-        _ => println!("{pad}{}", format_value(value)),
+        _ => writeln!(out, "{pad}{}", format_value(value))?,
     }
+    Ok(())
 }
 
 fn format_value(v: &serde_json::Value) -> String {
