@@ -23,11 +23,21 @@ struct Cli {
     /// Server address [host][:port] [default: $TUBER_URL, $TUBER_ADDR,
     /// $BEANSTALKD_URL, then localhost:11300]
     #[arg(value_name = "HOST")]
+    host: Option<String>,
+
+    /// Server address, as tuber-cli takes it; the same as HOST
+    #[arg(short, long, value_name = "ADDR", conflicts_with = "host")]
     addr: Option<String>,
 
     /// Poll interval in seconds
     #[arg(short, long, default_value = "1.5")]
     interval: f64,
+}
+
+impl Cli {
+    fn addr(self) -> Option<String> {
+        self.addr.or(self.host)
+    }
 }
 
 enum PollMsg {
@@ -303,8 +313,8 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
 
     let (tx, mut rx) = mpsc::channel::<PollMsg>(4);
-    let addr = tuber_lib::server_addr(cli.addr.as_deref());
     let interval = Duration::from_secs_f64(cli.interval);
+    let addr = tuber_lib::server_addr(cli.addr().as_deref());
 
     // Kept for command dispatch and for display; the poller takes its own copies.
     let cmd_addr = addr.clone();
@@ -392,6 +402,26 @@ mod tests {
     use app::test_support::{app_with, tube};
     use app::{FlushScope, Selection};
     use crossterm::event::KeyModifiers;
+
+    fn cli_addr(args: &[&str]) -> Result<Option<String>, clap::Error> {
+        Cli::try_parse_from(std::iter::once("tuber-tui").chain(args.iter().copied())).map(|c| c.addr())
+    }
+
+    /// `-a`/`--addr` is how tuber-cli takes the address, so it works here too,
+    /// beside the bare HOST.
+    #[test]
+    fn the_address_is_a_bare_host_or_addr_as_in_tuber_cli() {
+        assert_eq!(cli_addr(&[]).unwrap(), None);
+        assert_eq!(cli_addr(&["hetz01:11331"]).unwrap().as_deref(), Some("hetz01:11331"));
+        assert_eq!(cli_addr(&["--addr", "hetz01:11331"]).unwrap().as_deref(), Some("hetz01:11331"));
+        assert_eq!(cli_addr(&["-a", ":11301", "-i", "0.5"]).unwrap().as_deref(), Some(":11301"));
+    }
+
+    #[test]
+    fn a_host_and_addr_together_are_refused() {
+        let err = cli_addr(&["hetz01:11331", "--addr", "hetz01:11300"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     /// A plain press. `handle_key` is only ever reached for `KeyEventKind::Press`
     /// — the filter is in the select loop — so the default kind is right here.

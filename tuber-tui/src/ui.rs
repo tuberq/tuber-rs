@@ -403,20 +403,29 @@ fn top_bar_lines(app: &App) -> Vec<Line<'static>> {
     // Headroom: the numbers that turn into an outage if you look away. Absolute
     // figures ride along because there is room for them once the detail has gone.
     let mut headroom: Vec<Vec<Span<'static>>> = Vec::new();
+    // First, so a full line clips something else off its end: every put is
+    // being refused, and nothing else in the stats says so.
+    if s.binlog_failed {
+        headroom.push(vec![Span::styled(
+            "WAL FAILED",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]);
+    }
+    let in_use = s.memory_in_use();
     if s.max_jobs_size > 0 {
-        let pct = percent(s.current_jobs_size, s.max_jobs_size);
+        let pct = percent(in_use, s.max_jobs_size);
         headroom.push(labelled(
             "Mem",
             format!(
                 "{:.1}% ({} / {})",
                 pct,
-                format_bytes(s.current_jobs_size),
+                format_bytes(in_use),
                 format_bytes(s.max_jobs_size)
             ),
             usage_colour(pct),
         ));
-    } else if s.current_jobs_size > 0 {
-        headroom.push(labelled("Mem", format_bytes(s.current_jobs_size), Color::Reset));
+    } else if in_use > 0 {
+        headroom.push(labelled("Mem", format_bytes(in_use), Color::Reset));
     }
     if s.toast_total_bytes > 0 {
         // Live share, not usage: a low figure is fragmentation awaiting
@@ -1234,6 +1243,33 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
         lines.push(DetailLine { label: "oldest", spans: ages });
     }
 
+    // Puts an `idp:` key turned away, by the state of the job it matched. A
+    // match on a buried job queued nothing, and nothing runs until that job is
+    // kicked, so a recurring put that keeps hitting one drops its work every
+    // time. That count is the one in red.
+    let dedups = joined(
+        [
+            ("ready", tube.total_idp_dedups_ready),
+            ("reserved", tube.total_idp_dedups_reserved),
+            ("delayed", tube.total_idp_dedups_delayed),
+            ("buried", tube.total_idp_dedups_buried),
+            ("deleted", tube.total_idp_dedups_deleted),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(label, n)| match label {
+            "buried" => vec![Span::styled(
+                format!("{} buried", format_number(n)),
+                Style::default().fg(Color::Red),
+            )],
+            _ => pair(format_number(n), label),
+        })
+        .collect(),
+    );
+    if !dedups.is_empty() {
+        lines.push(DetailLine { label: "dedups", spans: dedups });
+    }
+
     // Waiting time and the spread behind the averages above.
     let mut queue: Vec<Vec<Span<'static>>> = Vec::new();
     if tube.queue_time_ewma > 0.0 {
@@ -1298,7 +1334,7 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
 /// have added a mode and a keybinding to say the same thing.
 ///
 /// It also gives a home to the 16 `ServerStats` fields nothing rendered — the
-/// WAL index range, the TOAST compaction counters, the corrupted and orphaned
+/// WAL index range, the TOAST compaction counters, the lost and reclaimed
 /// body tallies, the command totals, the host triple — and to the fast/slow
 /// threshold, which is server configuration and so belongs here rather than
 /// restated on every tube's runtime line.
@@ -1324,22 +1360,25 @@ fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec
     });
 
     // What could run out. Percentages carry the same thresholds the top bar
-    // uses, so a number that is fine there is not alarming here.
+    // uses, so a number that is fine there is not alarming here. Schedule
+    // entries count against the same budget as job bodies, so once there are
+    // any the figure is no longer just jobs, and the schedules line below
+    // says how much of it is theirs.
+    let in_use = server.memory_in_use();
+    let in_what = match server.current_schedules {
+        0 => "in jobs",
+        _ => "in use",
+    };
     let mut memory = vec![match server.max_jobs_size {
-        0 => pair(format_bytes(server.current_jobs_size), "in jobs"),
+        0 => pair(format_bytes(in_use), in_what),
         max => {
-            let pct = percent(server.current_jobs_size, max);
+            let pct = percent(in_use, max);
             vec![
                 Span::styled(
-                    format!(
-                        "{} / {} ({:.1}%)",
-                        format_bytes(server.current_jobs_size),
-                        format_bytes(max),
-                        pct
-                    ),
+                    format!("{} / {} ({:.1}%)", format_bytes(in_use), format_bytes(max), pct),
                     Style::default().fg(usage_colour(pct)),
                 ),
-                Span::styled(" in jobs", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {in_what}"), Style::default().fg(Color::DarkGray)),
             ]
         }
     }];
@@ -1350,6 +1389,19 @@ fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec
         memory.push(pair(format_bytes(server.max_job_size), "max job"));
     }
     lines.push(DetailLine { label: "memory", spans: joined(memory) });
+
+    if server.current_schedules > 0 {
+        lines.push(DetailLine {
+            label: "schedule",
+            spans: joined(vec![
+                pair(
+                    format_number(server.current_schedules),
+                    if server.current_schedules == 1 { "entry" } else { "entries" },
+                ),
+                pair(format_bytes(server.current_schedules_size), "of memory"),
+            ]),
+        });
+    }
 
     if server.max_storage_bytes > 0 {
         let used = server.binlog_total_bytes + server.toast_total_bytes;
@@ -1368,7 +1420,15 @@ fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec
         });
     }
 
-    if server.binlog_enabled {
+    if server.binlog_failed {
+        lines.push(DetailLine {
+            label: "wal",
+            spans: vec![Span::styled(
+                "failed: puts refused with INTERNAL_ERROR until restart",
+                Style::default().fg(Color::Red),
+            )],
+        });
+    } else if server.binlog_enabled {
         lines.push(DetailLine {
             label: "wal",
             spans: joined(vec![
@@ -1416,27 +1476,35 @@ fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec
         lines.push(DetailLine { label: "toast", spans: joined(toast) });
     }
 
-    // Anything the server has had to repair or give up on. Absent when all
-    // zero, which is the normal case — so its presence is itself the signal.
-    let repairs = joined(
+    // What the server has lost: jobs dropped at startup because their body was
+    // gone, and bodies compaction found corrupt. Absent when both are zero,
+    // which is the normal case, so its presence is itself the signal.
+    let lost = joined(
         [
-            ("corrupted", server.toast_bodies_dropped_corrupted, Color::Red),
-            ("recovered", server.recovered_missing_bodies, Color::Yellow),
-            ("orphans", server.reclaimed_orphan_bodies, Color::Yellow),
-            ("stranded", server.reclaimed_stranded_bodies, Color::Yellow),
+            (server.recovered_missing_bodies, "jobs, body missing"),
+            (server.toast_bodies_dropped_corrupted, "bodies corrupt"),
         ]
         .into_iter()
-        .filter(|(_, n, _)| *n > 0)
-        .map(|(label, n, colour)| {
-            vec![Span::styled(
-                format!("{} {label}", format_number(n)),
-                Style::default().fg(colour),
-            )]
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| {
+            vec![Span::styled(format!("{} {what}", format_number(n)), Style::default().fg(Color::Red))]
         })
         .collect(),
     );
-    if !repairs.is_empty() {
-        lines.push(DetailLine { label: "repairs", spans: repairs });
+    if !lost.is_empty() {
+        lines.push(DetailLine { label: "lost", spans: lost });
+    }
+
+    // Bodies of deleted jobs that startup dropped. TOAST deletes are index-only
+    // until compaction rewrites the segment, so every restart finds them again:
+    // a count of delete volume, not damage. The orphan and stranded passes
+    // differ only in whether the retained WAL still named the job.
+    let reclaimed = server.reclaimed_orphan_bodies + server.reclaimed_stranded_bodies;
+    if reclaimed > 0 {
+        lines.push(DetailLine {
+            label: "cleanup",
+            spans: pair(format_number(reclaimed), "deleted bodies reclaimed at start"),
+        });
     }
 
     lines.push(DetailLine {
@@ -1482,6 +1550,11 @@ fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec
         spans: joined(vec![
             pair(format_duration(server.processing_time_fast_threshold), "fast/slow split"),
             pair(format_number(server.total_jobs), "jobs ever"),
+            if server.tcp_keepalive > 0 {
+                pair(format_secs(server.tcp_keepalive), "keepalive")
+            } else {
+                Vec::new()
+            },
         ]),
     });
 
@@ -1721,9 +1794,9 @@ mod tests {
 
     #[test]
     fn a_tall_terminal_shows_the_whole_pane() {
-        // Six detail lines is the most a tube ever produces.
-        let (_, rows) = split_bottom(45, 8, 6);
-        assert_eq!(rows, 6, "all detail lines shown");
+        // Seven detail lines is the most a tube ever produces.
+        let (_, rows) = split_bottom(45, 8, 7);
+        assert_eq!(rows, 7, "all detail lines shown");
     }
 
     #[test]
@@ -2022,7 +2095,7 @@ mod tests {
 
         assert!(detail_line(&lines, "jobs").is_some(), "jobs is unconditional:\n{pane}");
         assert!(detail_line(&lines, "clients").is_some(), "clients is unconditional:\n{pane}");
-        for absent in ["runtime", "oldest", "waiting"] {
+        for absent in ["runtime", "oldest", "dedups", "waiting"] {
             assert!(
                 detail_line(&lines, absent).is_none(),
                 "{absent} has no data but was rendered:\n{pane}"
@@ -2055,8 +2128,13 @@ mod tests {
     fn the_server_pane_fits_eighty_columns() {
         let mut app = busy_server_app();
         app.selected = Some(Selection::Server);
+        let server = &mut app.current.as_mut().unwrap().server;
+        server.current_schedules = 10_000;
+        server.current_schedules_size = 5_000_000;
+        server.tcp_keepalive = 32_767;
         let lines = draw_frame(&app, 80, 34);
-        let pane_labels = ["rates", "memory", "disk", "wal", "toast", "repairs", "clients"];
+        let pane_labels =
+            ["rates", "memory", "schedule", "disk", "wal", "toast", "lost", "cleanup", "clients", "tuning"];
         for label in pane_labels {
             let content = detail_line(&lines, label)
                 .unwrap_or_else(|| panic!("no {label} line:\n{}", lines.join("\n")));
@@ -2072,7 +2150,8 @@ mod tests {
         );
         // Fields that were parsed on every poll and rendered nowhere.
         assert!(detail_line(&lines, "wal").unwrap().contains("12\u{2013}46"), "no WAL index range");
-        assert!(detail_line(&lines, "repairs").unwrap().contains("2 corrupted"), "no repairs");
+        assert!(detail_line(&lines, "lost").unwrap().contains("2 bodies corrupt"), "no corrupt bodies");
+        assert!(detail_line(&lines, "cleanup").unwrap().contains("7 deleted"), "no reclaimed bodies");
         assert!(detail_line(&lines, "commands").unwrap().contains("2.2M puts"), "no commands");
     }
 
@@ -2100,6 +2179,143 @@ mod tests {
         let mut app = App::new("test:11300".to_string());
         app.update(Snapshot { server, tubes: sample_tubes(), fetched_at: Instant::now() });
         app
+    }
+
+    /// Schedule entries are charged against `--max-jobs-size` beside job
+    /// bodies, and a put is refused once the two together reach it. A figure
+    /// of job bodies alone reads as headroom the server doesn't have.
+    #[test]
+    fn the_memory_budget_counts_schedule_entries() {
+        let server = ServerStats::from_yaml(
+            "version: tuber 0.16.0\ncurrent-jobs-size: 600\nmax-jobs-size: 1000\n\
+             current-schedules: 9\ncurrent-schedules-size: 300\ntcp-keepalive: 60\n",
+        );
+        let mut app = App::new("test:11300".to_string());
+        app.update(Snapshot { server, tubes: sample_tubes(), fetched_at: Instant::now() });
+        app.selected = Some(Selection::Server);
+        let lines = draw_frame(&app, 100, 34);
+        let frame = lines.join("\n");
+
+        assert!(frame.contains("Mem: 90.0%"), "top bar leaves schedules out:\n{frame}");
+        let memory = detail_line(&lines, "memory").unwrap();
+        assert!(memory.contains("(90.0%) in use"), "memory reads {memory:?}");
+        let schedules = detail_line(&lines, "schedule")
+            .unwrap_or_else(|| panic!("no schedules line:\n{frame}"));
+        assert_eq!(schedules, "9 entries \u{00b7} 300B of memory");
+        assert!(detail_line(&lines, "tuning").unwrap().contains("1m keepalive"), "no keepalive");
+    }
+
+    /// A label as wide as its column runs into its value (`schedules9 entries`),
+    /// so every label either pane can produce must leave at least one space.
+    #[test]
+    fn every_detail_label_leaves_a_gap() {
+        let mut server = busy_server_app().current.unwrap().server;
+        server.current_schedules = 9;
+        server.tcp_keepalive = 60;
+        let mut tube = rich_tube();
+        tube.total_idp_dedups_buried = 1;
+        tube.pause = 60;
+        tube.pause_time_left = 30;
+        let labels: Vec<&str> = server_detail_lines(&server, (1.0, 1.0, 1.0, 1.0))
+            .into_iter()
+            .chain(tube_detail_lines(&tube))
+            .map(|l| l.label)
+            .collect();
+        for label in labels {
+            assert!(label.chars().count() < DETAIL_LABEL, "{label:?} fills its column");
+        }
+    }
+
+    /// A failed WAL zeroes every binlog-* figure, which is how a server without
+    /// -b looks too, so the pane used to hide its wal line and say nothing while
+    /// every put was refused. `binlog-failed` tells them apart.
+    #[test]
+    fn a_failed_wal_is_flagged_not_hidden() {
+        let mut app = busy_server_app();
+        app.selected = Some(Selection::Server);
+        let server = &mut app.current.as_mut().unwrap().server;
+        server.binlog_enabled = false;
+        server.binlog_failed = true;
+        server.binlog_total_bytes = 0;
+        server.binlog_file_count = 0;
+        server.binlog_current_index = 0;
+        server.binlog_oldest_index = 0;
+        let lines = draw_frame(&app, 80, 34);
+        let frame = lines.join("\n");
+        // First on the headroom line, so a full line can't clip it off the end.
+        assert!(lines[2].starts_with(" WAL FAILED"), "headroom line reads {:?}", lines[2]);
+        let wal = detail_line(&lines, "wal").unwrap_or_else(|| panic!("no wal line:\n{frame}"));
+        assert!(wal.contains("puts refused"), "wal reads {wal:?}");
+
+        // An in-memory server is not a failed one.
+        let server = &mut app.current.as_mut().unwrap().server;
+        server.binlog_failed = false;
+        let lines = draw_frame(&app, 80, 34);
+        assert!(!lines.join("\n").contains("WAL FAILED"));
+        assert!(detail_line(&lines, "wal").is_none());
+    }
+
+    /// Bodies of deleted jobs come back on every restart until compaction
+    /// rewrites their segment, and startup drops them again: routine, so said
+    /// plainly. Jobs dropped for a missing body, and corrupt bodies, are loss.
+    #[test]
+    fn reclaimed_bodies_are_routine_and_lost_jobs_are_red() {
+        let alarming = |line: &DetailLine| {
+            line.spans.iter().any(|s| matches!(s.style.fg, Some(Color::Red | Color::Yellow)))
+        };
+        let text = |line: &DetailLine| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let mut server = busy_server_app().current.unwrap().server;
+        server.toast_bodies_dropped_corrupted = 0;
+        server.recovered_missing_bodies = 0;
+        server.reclaimed_orphan_bodies = 25_296;
+        server.reclaimed_stranded_bodies = 4;
+
+        let lines = server_detail_lines(&server, (0.0, 0.0, 0.0, 0.0));
+        assert!(!lines.iter().any(|l| l.label == "repairs" || l.label == "lost"), "routine cleanup raised an alarm");
+        let cleanup = lines.iter().find(|l| l.label == "cleanup").expect("no cleanup line");
+        assert!(text(cleanup).contains("25.3K deleted bodies reclaimed"), "cleanup reads {:?}", text(cleanup));
+        assert!(!alarming(cleanup), "cleanup is coloured as a warning");
+
+        server.recovered_missing_bodies = 3;
+        server.toast_bodies_dropped_corrupted = 2;
+        let lines = server_detail_lines(&server, (0.0, 0.0, 0.0, 0.0));
+        let lost = lines.iter().find(|l| l.label == "lost").expect("no lost line");
+        assert!(text(lost).contains("3 jobs, body missing"), "lost reads {:?}", text(lost));
+        assert!(text(lost).contains("2 bodies corrupt"), "lost reads {:?}", text(lost));
+        assert!(lost.spans.iter().any(|s| s.style.fg == Some(Color::Red)), "loss is not red");
+    }
+
+    /// Without schedules the server pane reads as it always has.
+    #[test]
+    fn a_server_without_schedules_has_no_schedules_line() {
+        let mut app = busy_server_app();
+        app.selected = Some(Selection::Server);
+        let lines = draw_frame(&app, 100, 34);
+        assert!(detail_line(&lines, "schedule").is_none());
+        assert!(detail_line(&lines, "memory").unwrap().contains("in jobs"));
+    }
+
+    /// A put whose `idp:` key matches a buried job queues nothing, and nothing
+    /// runs until that job is kicked: the count to notice, so it is red.
+    #[test]
+    fn the_pane_counts_idp_dedups_by_state() {
+        let mut tube = rich_tube();
+        tube.total_idp_dedups_ready = 9;
+        tube.total_idp_dedups_buried = 70;
+        let app = app_with_selection(vec![tube], "covers");
+        let lines = draw_frame(&app, 130, 24);
+        let dedups = detail_line(&lines, "dedups")
+            .unwrap_or_else(|| panic!("no dedups line:\n{}", lines.join("\n")));
+        assert_eq!(dedups, "9 ready \u{00b7} 70 buried");
+
+        let red = tube_detail_lines(&app.selected_tube().unwrap().clone())
+            .into_iter()
+            .find(|l| l.label == "dedups")
+            .unwrap()
+            .spans
+            .iter()
+            .any(|s| s.content.contains("70") && s.style.fg == Some(Color::Red));
+        assert!(red, "buried dedups not in red");
     }
 
     /// Down past the last tube lands on the totals row, and the tube commands
