@@ -1,6 +1,7 @@
 pub mod client;
 pub mod model;
 pub mod parse;
+pub mod schedule;
 
 const DEFAULT_HOST: &str = "localhost";
 const DEFAULT_PORT: &str = "11300";

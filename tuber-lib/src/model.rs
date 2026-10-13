@@ -31,7 +31,21 @@ pub struct ServerStats {
     pub max_job_size: u64,
     pub current_jobs_size: u64,
     pub max_jobs_size: u64,
+    /// Recurring schedule entries held, across all owners.
+    pub current_schedules: u64,
+    /// Memory the schedule entries are charged against `max_jobs_size`,
+    /// beside `current_jobs_size`. See [`memory_in_use`](Self::memory_in_use).
+    pub current_schedules_size: u64,
+    /// Seconds of silence before TCP keepalive probes start on a client
+    /// connection; 0 when off.
+    pub tcp_keepalive: u64,
     pub binlog_enabled: bool,
+    /// True after a WAL write or fsync error: persistence is gone and puts are
+    /// refused with `INTERNAL_ERROR` until restart. `binlog_enabled` and every
+    /// `binlog_*` figure read as they do without `-b` then, so this is what
+    /// tells a failed WAL from an in-memory server. Always false without `-b`,
+    /// and from servers before tuber 0.16.0.
+    pub binlog_failed: bool,
     pub binlog_total_bytes: u64,
     pub binlog_file_count: u64,
     pub binlog_current_index: u64,
@@ -54,6 +68,14 @@ pub struct ServerStats {
 }
 
 impl ServerStats {
+    /// What `max_jobs_size` is measured against: job bodies plus recurring
+    /// schedule entries. A put is refused `OUT_OF_MEMORY` when this would
+    /// pass the limit, so it is the figure to compare with it, not
+    /// `current_jobs_size` alone.
+    pub fn memory_in_use(&self) -> u64 {
+        self.current_jobs_size.saturating_add(self.current_schedules_size)
+    }
+
     pub fn from_yaml(yaml: &str) -> Self {
         let m = parse_yaml_map(yaml);
         Self {
@@ -81,7 +103,11 @@ impl ServerStats {
             max_job_size: get_u64(&m, "max-job-size"),
             current_jobs_size: get_u64(&m, "current-jobs-size"),
             max_jobs_size: get_u64(&m, "max-jobs-size"),
+            current_schedules: get_u64(&m, "current-schedules"),
+            current_schedules_size: get_u64(&m, "current-schedules-size"),
+            tcp_keepalive: get_u64(&m, "tcp-keepalive"),
             binlog_enabled: get_bool(&m, "binlog-enabled"),
+            binlog_failed: get_bool(&m, "binlog-failed"),
             binlog_total_bytes: get_u64(&m, "binlog-total-bytes"),
             binlog_file_count: get_u64(&m, "binlog-file-count"),
             binlog_current_index: get_u64(&m, "binlog-current-index"),
@@ -150,6 +176,16 @@ pub struct TubeStats {
     pub queue_time_max: f64,
     pub queue_time_samples: u64,
     pub cmd_delete: u64,
+    /// Puts whose `idp:` key matched a job already in the tube, by that job's
+    /// state, so nothing was queued. A dedup against a **buried** job is the
+    /// one to watch: nothing runs until that job is kicked, so a recurring
+    /// put that keeps hitting it drops its work every time.
+    pub total_idp_dedups_ready: u64,
+    pub total_idp_dedups_reserved: u64,
+    pub total_idp_dedups_delayed: u64,
+    pub total_idp_dedups_buried: u64,
+    /// Dedups against a cooldown tombstone (`idp:<key>:<ttl>`, job deleted).
+    pub total_idp_dedups_deleted: u64,
 }
 
 impl TubeStats {
@@ -203,6 +239,11 @@ impl TubeStats {
             queue_time_max: get_f64(&m, "queue-time-max"),
             queue_time_samples: get_u64(&m, "queue-time-samples"),
             cmd_delete: get_u64(&m, "cmd-delete"),
+            total_idp_dedups_ready: get_u64(&m, "total-idp-dedups-ready"),
+            total_idp_dedups_reserved: get_u64(&m, "total-idp-dedups-reserved"),
+            total_idp_dedups_delayed: get_u64(&m, "total-idp-dedups-delayed"),
+            total_idp_dedups_buried: get_u64(&m, "total-idp-dedups-buried"),
+            total_idp_dedups_deleted: get_u64(&m, "total-idp-dedups-deleted"),
         }
     }
 }
@@ -365,6 +406,43 @@ queue-time-samples: 28089
         assert!((t.processing_time_max - 77.396080).abs() < 1e-6);
         assert!((t.processing_time_fast_threshold - 0.1).abs() < 1e-9);
         assert!((t.queue_time_max - 52790.799139).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_idp_dedups_by_state() {
+        let yaml = "---\nname: \"splat.maintenance\"\ntotal-idp-dedups-ready: 4\n\
+                    total-idp-dedups-reserved: 3\ntotal-idp-dedups-delayed: 2\n\
+                    total-idp-dedups-buried: 70\ntotal-idp-dedups-deleted: 1\n";
+        let t = TubeStats::from_yaml(yaml);
+        assert_eq!(t.total_idp_dedups_ready, 4);
+        assert_eq!(t.total_idp_dedups_reserved, 3);
+        assert_eq!(t.total_idp_dedups_delayed, 2);
+        assert_eq!(t.total_idp_dedups_buried, 70);
+        assert_eq!(t.total_idp_dedups_deleted, 1);
+    }
+
+    #[test]
+    fn parses_schedule_and_keepalive_server_fields() {
+        let yaml = "---\ncurrent-jobs-size: 1000\nmax-jobs-size: 10000\n\
+                    tcp-keepalive: 60\ncurrent-schedules: 9\ncurrent-schedules-size: 4600\n";
+        let s = ServerStats::from_yaml(yaml);
+        assert_eq!(s.current_schedules, 9);
+        assert_eq!(s.current_schedules_size, 4600);
+        assert_eq!(s.tcp_keepalive, 60);
+        // Schedule entries are charged against max-jobs-size beside job bodies.
+        assert_eq!(s.memory_in_use(), 5600);
+    }
+
+    /// After a WAL failure every binlog-* figure is 0, as without -b; only
+    /// binlog-failed tells the two apart.
+    #[test]
+    fn parses_binlog_failed() {
+        let failed = ServerStats::from_yaml("---\nbinlog-enabled: false\nbinlog-failed: true\n");
+        assert!(!failed.binlog_enabled && failed.binlog_failed);
+        let in_memory = ServerStats::from_yaml("---\nbinlog-enabled: false\nbinlog-failed: false\n");
+        assert!(!in_memory.binlog_failed);
+        // Servers before tuber 0.16.0 don't report it.
+        assert!(!ServerStats::from_yaml("---\nbinlog-enabled: true\n").binlog_failed);
     }
 
     #[test]

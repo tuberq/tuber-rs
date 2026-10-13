@@ -1,5 +1,6 @@
 use crate::model::{GroupStats, JobStats, ServerStats, Snapshot, TubeStats};
 use crate::parse::parse_yaml_list;
+use crate::schedule::{self, ScheduleEntry, ScheduleStats, ScheduleSyncError, SyncResult};
 use std::io;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -360,6 +361,103 @@ impl TuberClient {
         self.expect_response("PAUSED").await
     }
 
+    /// The recurring schedule entries held, as `(owner, name)` pairs: all of
+    /// them, or `owner`'s.
+    /// Sends: `list-schedules [<owner>]\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
+    pub async fn list_schedules(&mut self, owner: Option<&str>) -> io::Result<Vec<(String, String)>> {
+        match owner {
+            Some(owner) => {
+                schedule::check_name("schedule owner", owner)?;
+                self.send_line(&format!("list-schedules {owner}")).await?;
+            }
+            None => self.send_line("list-schedules").await?,
+        }
+        let body = self.read_ok_body().await?;
+        Ok(parse_yaml_list(&body)
+            .iter()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(owner, name)| (owner.to_string(), name.to_string()))
+            .collect())
+    }
+
+    /// One schedule entry's definition, next fires, last fire and counters.
+    /// Sends: `stats-schedule <owner> <name>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
+    /// (`NOT_FOUND` comes back as the error's message, as for `stats-job`)
+    pub async fn stats_schedule(&mut self, owner: &str, name: &str) -> io::Result<ScheduleStats> {
+        schedule::check_name("schedule owner", owner)?;
+        schedule::check_name("schedule name", name)?;
+        self.send_line(&format!("stats-schedule {owner} {name}")).await?;
+        let body = self.read_ok_body().await?;
+        Ok(ScheduleStats::from_yaml(&body))
+    }
+
+    /// Replace `owner`'s recurring schedule with `entries`, in one step.
+    ///
+    /// - **Always the complete set.** On commit the owner's entries become
+    ///   exactly these: one not sent is deleted.
+    /// - **An empty set deletes them all**, so it is refused unless
+    ///   `allow_empty` is set. An app whose config failed to load must not
+    ///   wipe its schedule.
+    /// - **Sync at boot, not on reconnect.** During a rolling deploy an old
+    ///   process re-syncing would put back what the new release removed.
+    ///
+    /// Every entry is checked before anything is sent. If tuber refuses one,
+    /// the sync is aborted and the error names it; the owner's previous set
+    /// keeps running. If the connection drops partway, tuber discards what was
+    /// staged: re-run the whole sync on a new connection, which is safe, since
+    /// an identical set changes nothing. Never resume one partway.
+    ///
+    /// A refusal from tuber comes back as a [`ScheduleSyncError`] inside the
+    /// `io::Error`. Nothing changed unless its
+    /// [`is_live`](ScheduleSyncError::is_live) says the commit took but
+    /// couldn't be written to disk.
+    ///
+    /// Sends: `schedule-begin <owner>`, a `schedule-put` per entry framed like
+    /// `put`, then `schedule-commit` — expects: `SYNCED <added> <changed>
+    /// <removed> <unchanged>\r\n`
+    pub async fn sync_schedules(
+        &mut self,
+        owner: &str,
+        entries: &[ScheduleEntry],
+        allow_empty: bool,
+    ) -> io::Result<SyncResult> {
+        schedule::validate_sync(owner, entries, allow_empty)?;
+        let refused = |entry: Option<&str>, status: String| {
+            io::Error::other(ScheduleSyncError {
+                owner: owner.to_string(),
+                entry: entry.map(str::to_string),
+                status,
+            })
+        };
+
+        self.send_line(&format!("schedule-begin {owner}")).await?;
+        let line = self.read_line().await?;
+        if line != format!("SYNCING {owner}") {
+            return Err(refused(None, line));
+        }
+
+        for entry in entries {
+            self.writer.write_all(&schedule::frame(entry)).await?;
+            self.writer.flush().await?;
+            let line = self.read_line().await?;
+            if line != "STAGED" {
+                // The refusal has already doomed the commit; abort now rather
+                // than leave the staged set open on a connection the caller
+                // may go on using. Best effort: a connection that fails here
+                // has discarded the staged set anyway, and the refusal is
+                // what the caller needs to hear.
+                if self.send_line("schedule-abort").await.is_ok() {
+                    let _ = self.read_line().await;
+                }
+                return Err(refused(Some(&entry.name), line));
+            }
+        }
+
+        self.send_line("schedule-commit").await?;
+        let line = self.read_line().await?;
+        SyncResult::parse(&line).ok_or_else(|| refused(None, line))
+    }
+
     /// Expect a single-word response (e.g. "DELETED", "BURIED", "PAUSED").
     async fn expect_response(&mut self, expected: &str) -> io::Result<()> {
         let line = self.read_line().await?;
@@ -469,5 +567,176 @@ mod tests {
         for line in ["DRAINING", "BAD_FORMAT", "EXPECTED_CRLF", "JOB_TOO_BIG"] {
             assert!(parse_inserted(line).is_err(), "{line} should be an error");
         }
+    }
+
+    /// A one-connection server that answers the n-th command with
+    /// `replies[n]`, and hangs up on a command past the last. Its handle
+    /// yields every line it was sent, with a `schedule-put`'s body as the line
+    /// after it, so it resolves once the client hangs up too.
+    async fn converse(replies: &'static [&'static str]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut r = BufReader::new(r);
+            let mut sent = Vec::new();
+            let mut replies = replies.iter();
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let line = line.trim_end().to_string();
+                if line.starts_with("schedule-put ") {
+                    let n: usize = line.split_whitespace().nth(6).unwrap().parse().unwrap();
+                    let mut body = vec![0u8; n + 2];
+                    r.read_exact(&mut body).await.unwrap();
+                    body.truncate(n);
+                    sent.push(line);
+                    sent.push(String::from_utf8(body).unwrap());
+                } else {
+                    sent.push(line);
+                }
+                // Out of replies, hang up rather than leave the client waiting
+                // on one, but go on reading so the handle reports what it sent.
+                match replies.next() {
+                    Some(reply) => w.write_all(format!("{reply}\r\n").as_bytes()).await.unwrap(),
+                    None => w.shutdown().await.unwrap(),
+                }
+            }
+            sent
+        });
+        (addr, server)
+    }
+
+    fn entry(name: &str, spec: &str) -> ScheduleEntry {
+        ScheduleEntry {
+            name: name.into(),
+            tube: "splat.maintenance".into(),
+            pri: 1024,
+            delay: 0,
+            ttr: 120,
+            tags: vec!["con:maintenance".into()],
+            spec: spec.into(),
+            body: b"{}".to_vec(),
+        }
+    }
+
+    fn sync_error(err: &io::Error) -> &ScheduleSyncError {
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<ScheduleSyncError>())
+            .unwrap_or_else(|| panic!("not a ScheduleSyncError: {err}"))
+    }
+
+    #[tokio::test]
+    async fn a_sync_is_begin_puts_commit() {
+        let (addr, server) = converse(&["SYNCING splat", "STAGED", "STAGED", "SYNCED 1 1 2 0"]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let set = [entry("rollup", "5 * * * *"), entry("retention", "0 2 * * * Australia/Melbourne")];
+        let result = client.sync_schedules("splat", &set, false).await.unwrap();
+        assert_eq!(result, SyncResult { added: 1, changed: 1, removed: 2, unchanged: 0 });
+        drop(client);
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                "schedule-begin splat",
+                "schedule-put rollup splat.maintenance 1024 0 120 2 con:maintenance 5 * * * *",
+                "{}",
+                "schedule-put retention splat.maintenance 1024 0 120 2 con:maintenance 0 2 * * * Australia/Melbourne",
+                "{}",
+                "schedule-commit",
+            ]
+        );
+    }
+
+    /// A refused line dooms the commit, so the rest of the set is not sent: the
+    /// sync is aborted on the spot, and the error names the entry.
+    #[tokio::test]
+    async fn a_refused_entry_aborts_the_sync_and_is_named() {
+        let (addr, server) = converse(&["SYNCING splat", "STAGED", "BAD_SCHEDULE", "ABORTED"]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let set = [
+            entry("rollup", "5 * * * *"),
+            entry("retention", "0 2 * * * Australia/Melborne"),
+            entry("never_sent", "@daily"),
+        ];
+        let err = client.sync_schedules("splat", &set, false).await.unwrap_err();
+        let e = sync_error(&err);
+        assert_eq!((e.entry.as_deref(), e.status.as_str()), (Some("retention"), "BAD_SCHEDULE"));
+        assert!(!e.is_live());
+        drop(client);
+        let sent = server.await.unwrap();
+        assert_eq!(sent.last().map(String::as_str), Some("schedule-abort"));
+        assert!(!sent.iter().any(|l| l.contains("never_sent")), "sent past the refusal: {sent:?}");
+        assert!(!sent.iter().any(|l| l == "schedule-commit"), "committed: {sent:?}");
+    }
+
+    /// The refusal is what the caller needs to hear. A connection that drops
+    /// before the abort is answered has discarded the staged set anyway, so
+    /// losing it must not swap the entry's name for "connection closed".
+    #[tokio::test]
+    async fn a_refusal_is_reported_even_if_the_abort_fails() {
+        // No reply scripted for schedule-abort: the server hangs up instead.
+        let (addr, _server) = converse(&["SYNCING splat", "BAD_SCHEDULE"]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let err = client
+            .sync_schedules("splat", &[entry("retention", "0 2 * * * Australia/Melborne")], false)
+            .await
+            .unwrap_err();
+        let e = sync_error(&err);
+        assert_eq!((e.entry.as_deref(), e.status.as_str()), (Some("retention"), "BAD_SCHEDULE"));
+    }
+
+    #[tokio::test]
+    async fn a_commit_internal_error_is_live() {
+        let (addr, _server) = converse(&["SYNCING splat", "STAGED", "INTERNAL_ERROR"]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let err = client
+            .sync_schedules("splat", &[entry("rollup", "5 * * * *")], false)
+            .await
+            .unwrap_err();
+        let e = sync_error(&err);
+        assert_eq!((e.entry.as_deref(), e.status.as_str()), (None, "INTERNAL_ERROR"));
+        assert!(e.is_live());
+    }
+
+    #[tokio::test]
+    async fn an_old_server_says_it_has_no_schedules() {
+        let (addr, _server) = converse(&["UNKNOWN_COMMAND"]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let err = client
+            .sync_schedules("splat", &[entry("rollup", "5 * * * *")], false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no recurring schedules"), "{err}");
+    }
+
+    /// An invalid entry is refused before anything goes on the wire: the server
+    /// here would fail the test by hanging up on the first command.
+    #[tokio::test]
+    async fn an_invalid_set_sends_nothing() {
+        let (addr, server) = converse(&[]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let bad = [entry("rollup", "5 * * * *\r\nflush-tube splat.maintenance")];
+        let err = client.sync_schedules("splat", &bad, false).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let err = client.sync_schedules("splat", &[], false).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        drop(client);
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lists_schedules_as_owner_name_pairs() {
+        let (addr, server) = converse(&["OK 37\r\n---\n- splat rollup\n- splat retention\n"]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let list = client.list_schedules(Some("splat")).await.unwrap();
+        assert_eq!(
+            list,
+            [("splat".into(), "rollup".into()), ("splat".into(), "retention".into())]
+        );
+        drop(client);
+        assert_eq!(server.await.unwrap(), ["list-schedules splat"]);
     }
 }
