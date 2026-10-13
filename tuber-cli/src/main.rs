@@ -1,6 +1,9 @@
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
 use tuber_lib::client::TuberClient;
+
+mod schedule_file;
 
 #[derive(Parser)]
 #[command(name = "tuber-cli", version, about = "CLI for tuber/beanstalkd job queue")]
@@ -209,6 +212,40 @@ enum Command {
         #[arg(long)]
         delay: u32,
     },
+
+    /// List recurring schedule entries, as owner and name
+    ListSchedules {
+        /// Only this owner's entries
+        #[arg(long)]
+        owner: Option<String>,
+    },
+
+    /// Show one schedule entry: its spec, next fires, last result and counters
+    StatsSchedule {
+        /// The app that owns the entry
+        owner: String,
+
+        /// Entry name
+        name: String,
+    },
+
+    /// Replace an owner's whole recurring schedule with the entries in a file.
+    ///
+    /// The file is a JSON array of entries (see README). On success the
+    /// owner's entries are exactly those: any it had that the file leaves
+    /// out are deleted, so always sync the complete set. If tuber refuses
+    /// one entry, nothing changes and the previous schedule keeps running.
+    ScheduleSync {
+        /// The app's name for its set of entries
+        owner: String,
+
+        /// JSON file of entries, or - for stdin
+        file: String,
+
+        /// Allow an empty file, which deletes every entry the owner has
+        #[arg(long)]
+        allow_empty: bool,
+    },
 }
 
 #[tokio::main]
@@ -271,6 +308,17 @@ async fn main() -> anyhow::Result<()> {
                 tags.push(format!("con:{c}"));
             }
             let res = client.put_tagged(priority, delay, ttr, data.as_bytes(), &tags).await?;
+            // A dedup against a buried job is still not a failure, but nothing
+            // was queued and nothing runs until that job is kicked. Run from
+            // cron, a put like that drops its work every time, and only stderr
+            // gets mailed.
+            if res.existing_state.as_deref() == Some("BURIED") {
+                eprintln!(
+                    "warning: idempotency key matched buried job {}; nothing was \
+                     queued, and nothing will run until it is kicked",
+                    res.id
+                );
+            }
             match res.existing_state {
                 // idp: key matched -- nothing was enqueued, id is the existing job.
                 Some(state) => output(
@@ -386,6 +434,49 @@ async fn main() -> anyhow::Result<()> {
         Command::Pause { tube, delay } => {
             client.pause_tube(&tube, delay).await?;
             output(&cli.format, &serde_json::json!({ "status": "paused", "tube": tube, "delay": delay }))?;
+        }
+
+        Command::ListSchedules { owner } => {
+            let entries = client.list_schedules(owner.as_deref()).await?;
+            let entries: Vec<_> = entries
+                .into_iter()
+                .map(|(owner, name)| serde_json::json!({ "owner": owner, "name": name }))
+                .collect();
+            output(&cli.format, &entries)?;
+        }
+
+        Command::StatsSchedule { owner, name } => {
+            let stats = client.stats_schedule(&owner, &name).await?;
+            output(&cli.format, &stats)?;
+        }
+
+        Command::ScheduleSync { owner, file, allow_empty } => {
+            let json = if file == "-" {
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&file).with_context(|| format!("reading {file}"))?
+            };
+            let entries = schedule_file::parse(&json)?;
+            if entries.is_empty() && !allow_empty {
+                let source = if file == "-" { "stdin" } else { file.as_str() };
+                anyhow::bail!(
+                    "{source} has no entries, and syncing none removes all of {owner}'s \
+                     schedules; pass --allow-empty if that's meant"
+                );
+            }
+            let result = client.sync_schedules(&owner, &entries, allow_empty).await?;
+            output(
+                &cli.format,
+                &serde_json::json!({
+                    "owner": owner,
+                    "added": result.added,
+                    "changed": result.changed,
+                    "removed": result.removed,
+                    "unchanged": result.unchanged,
+                }),
+            )?;
         }
     }
 
