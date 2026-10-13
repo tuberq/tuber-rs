@@ -65,6 +65,13 @@ tuber-cli peek 42
 tuber-cli drain
 tuber-cli undrain
 
+# Recurring schedules (tuber only): inspect them...
+tuber-cli list-schedules --owner splat
+tuber-cli stats-schedule splat rollup
+
+# ...and replace an owner's whole set from a JSON file (- for stdin)
+tuber-cli schedule-sync splat schedule.json
+
 # Text output instead of JSON
 tuber-cli stats --format text
 ```
@@ -74,6 +81,52 @@ Note that a reservation belongs to the connection that made it, and each
 the process exits, which is why there is no `tuber-cli bury`, `release` or
 `touch` — nothing can follow `reserve` to finish the job. Use `tuber-lib` (or
 one `nc` session) to reserve and finish a job together; see `skill/SKILL.md`.
+
+A put whose `--idempotent` key matches a buried job still exits 0 (the key did
+its job), but warns on stderr: nothing was queued, and nothing runs until that
+job is kicked, so a put from cron that keeps hitting it would otherwise drop
+its work without a word.
+
+### Recurring schedules
+
+Tuber can fire jobs on a timer itself, so an app needs no scheduler process.
+An app owns its entries under a name of its choosing (the *owner*) and
+replaces the whole set in one sync; tuber's
+[scheduling guide](https://github.com/tuberq/tuber/blob/main/docs/scheduling.md)
+covers when and how. `schedule-sync` reads the set as a JSON array:
+
+```json
+[
+  {"name": "rollup", "tube": "splat.maintenance", "cron": "5 * * * *",
+   "idp": "rollup", "con": "maintenance", "pri": 1024, "ttr": 120,
+   "body": {"class": "HistogramRollupJob", "args": []}},
+  {"name": "retention", "tube": "splat.maintenance",
+   "cron": "0 2 * * *", "zone": "Australia/Melbourne", "con": "maintenance",
+   "body": {"class": "DataRetentionJob", "args": []}},
+  {"name": "monitor", "tube": "splat.checkins", "every": 60,
+   "idp": "monitor", "catchup": "never", "body": "monitor"}
+]
+```
+
+| Field | |
+|---|---|
+| `name`, `tube`, `body` | Required. A string body is put verbatim; a JSON object or array is put as written, less whitespace. |
+| `cron` + optional `zone` | 5-field cron or `@daily`-style macro, in an IANA zone (default UTC) |
+| `every` + optional `offset` | Seconds, or `"10m"`/`"1h"`/`"1d"`, aligned to the Unix epoch |
+| `spec` | The spec as tuber reads it, instead of the two above |
+| `pri`, `delay`, `ttr` | As for `put`; default 65536, 0, 120, as tuber-gem has them (not `put`'s priority 0, which is urgent) |
+| `idp`, `con`, `grp`, `aft` | The tag's value, as on the wire: `"rollup"`, `"maintenance:2"` |
+| `catchup` | After downtime: `"once"` (default), `"never"` (or `false`), or a number of seconds |
+
+Exactly one of `cron`, `every` and `spec`. An unknown field is an error, so a
+misspelled `zone` can't silently run an entry in UTC.
+
+The set **replaces** the owner's entries: any the file leaves out are deleted.
+An empty file is refused unless you pass `--allow-empty`, which is how you
+remove them all. If tuber refuses one entry (an unknown zone, a cron that never
+matches), the sync is aborted, nothing changes, and the run exits 1 naming the
+entry. Sync at deploy or boot; don't re-sync an app's owner by hand, or its
+next boot will undo it.
 
 ### Options
 
@@ -94,10 +147,10 @@ A real-time terminal dashboard for monitoring tuber queues.
 
 ### Features
 
-- Live server stats: version, uptime, connections, memory and disk headroom, drain status
+- Live server stats: version, uptime, connections, memory and disk headroom, drain status, and a red `WAL FAILED` when persistence has stopped and puts are being refused
 - Per-tube job counts in fixed, colour-coded columns — ready, urgent, reserved, delayed, buried — beside a log-scaled bar sizing each tube against the busiest
 - Throughput rates: puts/s, reserves/s, deletes/s, timeouts/s
-- A detail pane for whichever tube the cursor is on: bimodal processing EWMA, percentiles, oldest job ages, bury rate, watcher counts
+- A detail pane for whichever tube the cursor is on: bimodal processing EWMA, percentiles, oldest job ages, bury rate, `idp:` dedups (a dedup against a buried job in red), watcher counts
 - Server totals as a footer row on the table, selectable like a tube to turn the pane over to the server
 - Queue growth indicators
 - Buried job highlighting
@@ -109,7 +162,9 @@ runtimes, oldest ages and clients:
 ![tuber-tui with a tube selected](screenshots/tuber-tui-tube.png)
 
 Move onto the `server` footer row and the pane turns over to server-wide totals —
-memory, disk, WAL and TOAST headroom, command counts, host:
+memory, disk, WAL and TOAST headroom, recurring schedules, command counts, host.
+Memory headroom counts schedule entries as well as job bodies, since tuber
+charges both to `--max-jobs-size`:
 
 ![tuber-tui with the server row selected](screenshots/tuber-tui-server.png)
 
@@ -131,6 +186,7 @@ cargo install --path tuber-tui
 tuber-tui                        # connects to $TUBER_URL or localhost:11300
 tuber-tui staging.example.com    # custom host
 tuber-tui :11301                 # custom port
+tuber-tui -a :11301              # or -a/--addr, as tuber-cli takes it
 tuber-tui -i 0.5                 # faster polling (0.5s)
 ```
 
