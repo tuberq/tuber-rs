@@ -39,3 +39,50 @@ fn other_dedups_and_fresh_puts_are_quiet() {
         assert!(out.stderr.is_empty(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
     }
 }
+
+/// A dedup whose put was more urgent than the job it matched raises that job's
+/// priority, and tuber says to what: `INSERTED <id> <state> <pri>`.
+#[test]
+fn a_dedup_that_raised_the_priority_says_so() {
+    let out = put(&[b"USING splat.maintenance\r\n", b"INSERTED 47101 READY 10\r\n"]);
+    assert!(out.status.success(), "status: {:?}", out.status);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "id": 47101, "duplicate": true, "state": "READY", "raised_pri": 10 })
+    );
+}
+
+fn put_with(args: &[&str], replies: &[&'static [u8]]) -> (Output, Vec<String>) {
+    let server = scripted_server(replies);
+    let out = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
+        .args(["--addr", &server.addr, "put"])
+        .args(args)
+        .output()
+        .unwrap();
+    (out, server.transcript())
+}
+
+/// In `idp:series:123` the last colon starts a TTL, so tuber would read key
+/// `series` with a 123s TTL. --idempotent-ttl is how to give a TTL, so a colon
+/// in the key is refused rather than misread.
+#[test]
+fn an_idempotency_key_with_a_colon_is_refused() {
+    let (out, sent) = put_with(
+        &["--idempotent", "series:123", "x"],
+        &[b"USING default\r\n", b"INSERTED 1\r\n"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!sent.iter().any(|l| l.starts_with("put")), "sent: {sent:?}");
+}
+
+/// --concurrency has no flag of its own for the limit, so `key:N` gives one.
+#[test]
+fn a_concurrency_key_may_carry_its_limit() {
+    let (out, sent) = put_with(
+        &["--concurrency", "user-42:3", "--idempotent", "k", "--idempotent-ttl", "60", "x"],
+        &[b"USING default\r\n", b"INSERTED 1\r\n"],
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(sent[1], "put 0 0 120 1 idp:k:60 con:user-42:3");
+}

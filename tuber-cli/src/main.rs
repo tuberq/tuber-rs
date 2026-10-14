@@ -1,7 +1,9 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use std::fmt;
 use std::io::{Read, Write};
-use tuber_lib::{Job, Reserved, TuberClient};
+use std::process::ExitCode;
+use tuber_lib::{tag, Job, Reserved, TuberClient};
 
 mod schedule_file;
 
@@ -64,7 +66,8 @@ enum Command {
         ttr: u32,
 
         /// Idempotency key: drop the put if a live job with this key exists in
-        /// the tube. Avoid colons in the key -- the last one is read as a TTL.
+        /// the tube. Letters, digits and - + / ; . $ _ ( ): no colon, which
+        /// tuber would read as the start of a TTL.
         #[arg(long)]
         idempotent: Option<String>,
 
@@ -80,7 +83,8 @@ enum Command {
         #[arg(long)]
         after: Option<String>,
 
-        /// Concurrency key: limit how many jobs with this key run at once
+        /// Concurrency key: at most one job with this key runs at once, or N
+        /// as key:N
         #[arg(long)]
         concurrency: Option<String>,
     },
@@ -201,6 +205,7 @@ enum Command {
     /// Delete multiple jobs by ID
     DeleteBatch {
         /// Job IDs
+        #[arg(required = true)]
         ids: Vec<u64>,
     },
 
@@ -249,9 +254,96 @@ enum Command {
     },
 }
 
+/// Exit codes, one per kind of outcome, so a script can tell "no such job"
+/// from "no server". Clap's own usage errors exit 2 as well.
+mod exit {
+    pub const OTHER: u8 = 1;
+    /// Bad arguments, refused before anything was sent.
+    pub const USAGE: u8 = 2;
+    /// `NOT_FOUND`, or a `delete-batch` id that was.
+    pub const NOT_FOUND: u8 = 3;
+    /// A reserve that got no job: `TIMED_OUT` or `DEADLINE_SOON`.
+    pub const NO_JOB: u8 = 4;
+    /// Tuber refused the command: `DRAINING`, `OUT_OF_MEMORY`, a schedule
+    /// entry, …
+    pub const REFUSED: u8 = 5;
+    /// No server, or it stopped answering or made no sense.
+    pub const UNREACHABLE: u8 = 6;
+}
+
+/// A failure the CLI itself decides on, rather than one the client reports.
+#[derive(Debug)]
+enum Failure {
+    /// A reserve that got no job, with tuber's reply.
+    NoJob(&'static str),
+    /// Arguments that can't be acted on.
+    Usage(String),
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::NoJob(reply) => f.write_str(reply),
+            Failure::Usage(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let format = cli.format.clone();
+    match run(cli).await {
+        Ok(code) => code,
+        Err(err) => report(&format, &err),
+    }
+}
+
+/// Report `err` on stderr, as JSON or a line of text, and return its exit
+/// code. Never a backtrace: the message is the whole story.
+fn report(format: &OutputFormat, err: &anyhow::Error) -> ExitCode {
+    let (error, code) = classify(err);
+    let message = format!("{err:#}");
+    let line = match format {
+        OutputFormat::Json => serde_json::json!({ "error": error, "message": message }).to_string(),
+        OutputFormat::Text => format!("Error: {message}"),
+    };
+    // Nothing more to do if stderr is gone too.
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+    ExitCode::from(code)
+}
+
+/// The `error` word a failure reports, and its exit code: tuber's own reply
+/// where there is one, so it reads as it does in tuber's docs.
+fn classify(err: &anyhow::Error) -> (String, u8) {
+    use tuber_lib::Error as E;
+    if let Some(failure) = err.downcast_ref::<Failure>() {
+        return match failure {
+            Failure::NoJob(reply) => (reply.to_string(), exit::NO_JOB),
+            Failure::Usage(_) => ("INVALID_INPUT".into(), exit::USAGE),
+        };
+    }
+    let Some(err) = err.downcast_ref::<E>() else {
+        return ("ERROR".into(), exit::OTHER);
+    };
+    match err {
+        E::NotFound => ("NOT_FOUND".into(), exit::NOT_FOUND),
+        E::DeadlineSoon => ("DEADLINE_SOON".into(), exit::NO_JOB),
+        E::InvalidInput(_) => ("INVALID_INPUT".into(), exit::USAGE),
+        E::Io(_) => ("UNREACHABLE".into(), exit::UNREACHABLE),
+        E::Timeout => ("NO_REPLY".into(), exit::UNREACHABLE),
+        E::Protocol(_) | E::Closed => ("PROTOCOL_ERROR".into(), exit::UNREACHABLE),
+        E::ScheduleSync(e) => (e.status.clone(), exit::REFUSED),
+        other => match other.reply() {
+            Some(reply) => (reply.to_string(), exit::REFUSED),
+            None => ("ERROR".into(), exit::OTHER),
+        },
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let addr = tuber_lib::server_addr(cli.addr.as_deref());
     let mut client = TuberClient::connect(&addr).await?;
 
@@ -296,18 +388,26 @@ async fn main() -> anyhow::Result<()> {
             let mut tags = Vec::new();
             if let Some(key) = idempotent {
                 tags.push(match idempotent_ttl {
-                    Some(ttl) => format!("idp:{key}:{ttl}"),
-                    None => format!("idp:{key}"),
+                    Some(ttl) => tag::idp_for(&key, ttl)?,
+                    None => tag::idp(&key)?,
                 });
             }
             if let Some(g) = group {
-                tags.push(format!("grp:{g}"));
+                tags.push(tag::group(&g)?);
             }
             if let Some(a) = after {
-                tags.push(format!("aft:{a}"));
+                tags.push(tag::after(&a)?);
             }
             if let Some(c) = concurrency {
-                tags.push(format!("con:{c}"));
+                tags.push(match c.rsplit_once(':') {
+                    Some((key, limit)) => {
+                        let limit = limit.parse().map_err(|_| {
+                            Failure::Usage(format!("--concurrency {c}: the limit after the colon must be a number"))
+                        })?;
+                        tag::concurrency_limit(key, limit)?
+                    }
+                    None => tag::concurrency(&c)?,
+                });
             }
             let res = client.put_tagged(priority, delay, ttr, &data, &tags).await?;
             // A dedup against a buried job is still not a failure, but nothing
@@ -321,14 +421,20 @@ async fn main() -> anyhow::Result<()> {
                     res.id
                 );
             }
-            match res.existing_state {
-                // idp: key matched -- nothing was enqueued, id is the existing job.
-                Some(state) => output(
-                    &cli.format,
-                    &serde_json::json!({ "id": res.id, "duplicate": true, "state": state }),
-                )?,
-                None => output(&cli.format, &serde_json::json!({ "id": res.id }))?,
+            let mut json = serde_json::json!({ "id": res.id });
+            // idp: key matched -- nothing was enqueued, id is the existing job.
+            if let Some(state) = res.existing_state {
+                json["duplicate"] = true.into();
+                json["state"] = state.into();
             }
+            if let Some(pri) = res.raised_pri {
+                json["raised_pri"] = pri.into();
+            }
+            // beanstalkd out of memory: queued, but buried until kicked.
+            if res.buried {
+                json["buried"] = true.into();
+            }
+            output(&cli.format, &json)?;
         }
 
         Command::Reserve { timeout, tube } => {
@@ -337,8 +443,8 @@ async fn main() -> anyhow::Result<()> {
             }
             match client.reserve_with_timeout(timeout).await? {
                 Reserved::Job(job) => output(&cli.format, &job_json(&job))?,
-                Reserved::TimedOut => anyhow::bail!("TIMED_OUT"),
-                Reserved::DeadlineSoon => anyhow::bail!("DEADLINE_SOON"),
+                Reserved::TimedOut => return Err(Failure::NoJob("TIMED_OUT").into()),
+                Reserved::DeadlineSoon => return Err(Failure::NoJob("DEADLINE_SOON").into()),
             }
         }
 
@@ -429,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
             let (deleted, not_found) = client.delete_batch(&ids).await?;
             output(&cli.format, &serde_json::json!({ "deleted": deleted, "not_found": not_found }))?;
             if not_found > 0 {
-                std::process::exit(1);
+                return Ok(ExitCode::from(exit::NOT_FOUND));
             }
         }
 
@@ -463,10 +569,11 @@ async fn main() -> anyhow::Result<()> {
             let entries = schedule_file::parse(&json)?;
             if entries.is_empty() && !allow_empty {
                 let source = if file == "-" { "stdin" } else { file.as_str() };
-                anyhow::bail!(
+                return Err(Failure::Usage(format!(
                     "{source} has no entries, and syncing none removes all of {owner}'s \
                      schedules; pass --allow-empty if that's meant"
-                );
+                ))
+                .into());
             }
             let result = client.sync_schedules(&owner, &entries, allow_empty).await?;
             output(
@@ -482,7 +589,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// A job as JSON: its body as a string when it is UTF-8, and otherwise as

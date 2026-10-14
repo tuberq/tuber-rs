@@ -42,9 +42,9 @@ fn text_output_into_a_closed_pipe_exits_cleanly() {
 
 #[test]
 fn a_closed_pipe_keeps_the_commands_own_exit_status() {
-    // delete-batch exits 1 when any id was not found; losing the reader of its
-    // output must not turn that into a success.
+    // delete-batch exits 3, as NOT_FOUND does, when any id was not found;
+    // losing the reader of its output must not turn that into a success.
     let out = run_with_closed_stdout(b"DELETED_BATCH 1 1\r\n", &["delete-batch", "1", "2"]);
     assert_no_panic(&out);
-    assert_eq!(out.status.code(), Some(1), "status: {:?}", out.status);
+    assert_eq!(out.status.code(), Some(3), "status: {:?}", out.status);
 }

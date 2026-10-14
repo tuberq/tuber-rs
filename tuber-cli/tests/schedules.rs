@@ -62,7 +62,8 @@ fn sync_sends_the_file_as_one_sync() {
 fn a_refused_entry_fails_the_run_and_names_it() {
     let server = scripted_server(&[b"SYNCING splat\r\n", b"STAGED\r\n", b"BAD_SCHEDULE\r\n", b"ABORTED\r\n"]);
     let out = run(&server, &["schedule-sync", "splat", "-"], &SPLAT.replace("Melbourne", "Melborne"));
-    assert_eq!(out.status.code(), Some(1));
+    // Refused by tuber.
+    assert_eq!(out.status.code(), Some(5));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("retention") && stderr.contains("BAD_SCHEDULE"), "{stderr}");
     assert!(stderr.contains("nothing changed"), "{stderr}");
@@ -74,7 +75,8 @@ fn a_refused_entry_fails_the_run_and_names_it() {
 fn an_empty_file_needs_allow_empty() {
     let server = scripted_server(&[b"SYNCING splat\r\n", b"SYNCED 0 0 9 0\r\n"]);
     let out = run(&server, &["schedule-sync", "splat", "-"], "[]");
-    assert_eq!(out.status.code(), Some(1));
+    // Refused before anything was sent, as a usage error.
+    assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--allow-empty"), "{stderr}");
     // `-` is how stdin is named on the command line, not in a sentence.

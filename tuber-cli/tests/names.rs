@@ -38,3 +38,14 @@ fn a_tag_with_a_space_does_not_reach_the_server() {
     assert!(!sent.iter().any(|l| l.starts_with("put")), "sent: {sent:?}");
 }
 
+/// `delete-batch` with no ids is a mistake, not a request to delete nothing.
+#[test]
+fn a_bare_delete_batch_is_a_usage_error() {
+    let server = scripted_server(&[b"DELETED_BATCH 0 0\r\n"]);
+    let out = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
+        .args(["--addr", &server.addr, "delete-batch"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(server.transcript().is_empty(), "sent: {:?}", server.transcript());
+}
