@@ -7,10 +7,8 @@ use app::{
 };
 use clap::Parser;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::ExecutableCommand;
 use futures::StreamExt;
-use std::io::stdout;
+use ratatui::DefaultTerminal;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tuber_lib::client::TuberClient;
@@ -29,8 +27,17 @@ struct Cli {
     addr: Option<String>,
 
     /// Poll interval in seconds
-    #[arg(short, long, default_value = "1.5")]
-    interval: f64,
+    #[arg(short, long, default_value = "1.5", value_parser = parse_interval)]
+    interval: Duration,
+}
+
+/// A poll interval: a positive number of seconds, at most a day.
+fn parse_interval(s: &str) -> Result<Duration, String> {
+    let secs: f64 = s.parse().map_err(|_| format!("{s:?} is not a number of seconds"))?;
+    if !(secs > 0.0 && secs <= 86_400.0) {
+        return Err(format!("{s} is not a number of seconds between 0 and 86400"));
+    }
+    Ok(Duration::from_secs_f64(secs))
 }
 
 impl Cli {
@@ -304,16 +311,22 @@ fn spawn_command(addr: String, command: Command, tx: mpsc::Sender<PollMsg>) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Everything that can refuse the arguments does so here, before the
+    // terminal is taken over.
     let cli = Cli::parse();
-
-    // Terminal setup
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    let mut terminal = ratatui::init();
-
-    let (tx, mut rx) = mpsc::channel::<PollMsg>(4);
-    let interval = Duration::from_secs_f64(cli.interval);
+    let interval = cli.interval;
     let addr = tuber_lib::server_addr(cli.addr().as_deref());
+
+    // ratatui::init enters raw mode and the alternate screen, and installs a
+    // panic hook that undoes both; restore undoes them on every other way out.
+    let mut terminal = ratatui::init();
+    let result = run(&mut terminal, addr, interval).await;
+    ratatui::restore();
+    result
+}
+
+async fn run(terminal: &mut DefaultTerminal, addr: String, interval: Duration) -> anyhow::Result<()> {
+    let (tx, mut rx) = mpsc::channel::<PollMsg>(4);
 
     // Kept for command dispatch and for display; the poller takes its own copies.
     let cmd_addr = addr.clone();
@@ -389,9 +402,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Terminal teardown
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
     Ok(())
 }
 
@@ -404,6 +414,20 @@ mod tests {
 
     fn cli_addr(args: &[&str]) -> Result<Option<String>, clap::Error> {
         Cli::try_parse_from(std::iter::once("tuber-tui").chain(args.iter().copied())).map(|c| c.addr())
+    }
+
+    /// `Duration::from_secs_f64` panics on a negative, NaN or huge interval,
+    /// and did so with the terminal already in raw mode and the alternate
+    /// screen. Such a value is refused while parsing, before the terminal is
+    /// touched.
+    #[test]
+    fn an_interval_that_is_not_a_positive_time_is_refused() {
+        for bad in ["-1", "NaN", "inf", "0", "1e300"] {
+            let parsed = Cli::try_parse_from(["tuber-tui", &format!("--interval={bad}")]);
+            assert!(parsed.is_err(), "--interval={bad} was accepted");
+        }
+        let parsed = Cli::try_parse_from(["tuber-tui", "--interval=0.5"]).unwrap();
+        assert_eq!(parsed.interval, Duration::from_millis(500));
     }
 
     /// `-a`/`--addr` is how tuber-cli takes the address, so it works here too,
