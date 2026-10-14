@@ -317,9 +317,14 @@ async fn main() -> anyhow::Result<()> {
     let interval = cli.interval;
     let addr = tuber_lib::server_addr(cli.addr().as_deref());
 
-    // ratatui::init enters raw mode and the alternate screen, and installs a
-    // panic hook that undoes both; restore undoes them on every other way out.
-    let mut terminal = ratatui::init();
+    // try_init enters raw mode and the alternate screen, and installs a panic
+    // hook that undoes both; restore undoes them on every other way out.
+    // Without a terminal (cron, a pipe) it fails, where init would panic.
+    let mut terminal = ratatui::try_init().map_err(|e| {
+        // Raw mode may be on if the alternate screen was what failed.
+        let _ = crossterm::terminal::disable_raw_mode();
+        anyhow::anyhow!("tuber-tui needs a terminal: {e}")
+    })?;
     let result = run(&mut terminal, addr, interval).await;
     ratatui::restore();
     result
