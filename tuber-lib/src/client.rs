@@ -1,4 +1,5 @@
 use crate::model::{GroupStats, JobStats, ServerStats, Snapshot, TubeStats};
+use crate::name::{check_name, check_tag};
 use crate::parse::parse_yaml_list;
 use crate::schedule::{self, ScheduleEntry, ScheduleStats, ScheduleSyncError, SyncResult};
 use std::io;
@@ -70,6 +71,7 @@ impl TuberClient {
     }
 
     pub async fn stats_tube(&mut self, tube: &str) -> io::Result<TubeStats> {
+        check_name("tube name", tube)?;
         self.send_line(&format!("stats-tube {tube}")).await?;
         let body = self.read_ok_body().await?;
         Ok(TubeStats::from_yaml(&body))
@@ -95,6 +97,7 @@ impl TuberClient {
     /// Switch to a tube for subsequent put commands.
     /// Sends: `use <tube>\r\n` — expects: `USING <tube>\r\n`
     pub async fn use_tube(&mut self, tube: &str) -> io::Result<String> {
+        check_name("tube name", tube)?;
         self.send_line(&format!("use {tube}")).await?;
         let line = self.read_line().await?;
         if let Some(name) = line.strip_prefix("USING ") {
@@ -113,7 +116,9 @@ impl TuberClient {
     /// Put a job with tuber extension tags appended to the `put` line, e.g.
     /// `idp:<key>[:<ttl>]` (idempotent put), `grp:<name>` (job group),
     /// `aft:<group>` (run after a group completes), `con:<key>` (concurrency
-    /// limit). Tags are passed through verbatim.
+    /// limit). Tags are passed through verbatim, but one that is empty or holds
+    /// whitespace is refused before anything is sent, since it would split the
+    /// line.
     ///
     /// Note on `idp:` keys — the LAST colon separates key from TTL, so
     /// `idp:series:123` means key `series` with a 123s TTL, not key
@@ -132,6 +137,9 @@ impl TuberClient {
         data: &[u8],
         tags: &[String],
     ) -> io::Result<PutResult> {
+        for tag in tags {
+            check_tag(tag)?;
+        }
         let mut cmd = format!("put {} {} {} {}", priority, delay, ttr, data.len());
         for tag in tags {
             cmd.push(' ');
@@ -190,6 +198,7 @@ impl TuberClient {
     /// Add a tube to the watch set for subsequent reserves.
     /// Sends: `watch <tube>\r\n` — expects: `WATCHING <count>\r\n`
     pub async fn watch(&mut self, tube: &str) -> io::Result<u64> {
+        check_name("tube name", tube)?;
         self.send_line(&format!("watch {tube}")).await?;
         self.read_u64_response("WATCHING").await
     }
@@ -197,6 +206,7 @@ impl TuberClient {
     /// Remove a tube from the watch set.
     /// Sends: `ignore <tube>\r\n` — expects: `WATCHING <count>\r\n` (or `NOT_IGNORED` if it was the last)
     pub async fn ignore(&mut self, tube: &str) -> io::Result<u64> {
+        check_name("tube name", tube)?;
         self.send_line(&format!("ignore {tube}")).await?;
         self.read_u64_response("WATCHING").await
     }
@@ -286,6 +296,7 @@ impl TuberClient {
     /// Show statistics for a job group.
     /// Sends: `stats-group <name>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
     pub async fn stats_group(&mut self, name: &str) -> io::Result<GroupStats> {
+        check_name("group name", name)?;
         self.send_line(&format!("stats-group {name}")).await?;
         let body = self.read_ok_body().await?;
         Ok(GroupStats::from_yaml(&body))
@@ -294,6 +305,7 @@ impl TuberClient {
     /// Flush all jobs from a tube.
     /// Sends: `flush-tube <tube>\r\n` — expects: `FLUSHED <count>\r\n`
     pub async fn flush_tube(&mut self, tube: &str) -> io::Result<u64> {
+        check_name("tube name", tube)?;
         self.send_line(&format!("flush-tube {tube}")).await?;
         self.read_u64_response("FLUSHED").await
     }
@@ -302,6 +314,7 @@ impl TuberClient {
     /// jobs are left untouched.
     /// Sends: `flush-buried <tube>\r\n` — expects: `FLUSHED <count>\r\n`
     pub async fn flush_buried(&mut self, tube: &str) -> io::Result<u64> {
+        check_name("tube name", tube)?;
         self.send_line(&format!("flush-buried {tube}")).await?;
         self.read_u64_response("FLUSHED").await
     }
@@ -357,6 +370,7 @@ impl TuberClient {
     /// Pause a tube for `delay` seconds.
     /// Sends: `pause-tube <tube> <delay>\r\n` — expects: `PAUSED\r\n`
     pub async fn pause_tube(&mut self, tube: &str, delay: u32) -> io::Result<()> {
+        check_name("tube name", tube)?;
         self.send_line(&format!("pause-tube {tube} {delay}")).await?;
         self.expect_response("PAUSED").await
     }
@@ -367,7 +381,7 @@ impl TuberClient {
     pub async fn list_schedules(&mut self, owner: Option<&str>) -> io::Result<Vec<(String, String)>> {
         match owner {
             Some(owner) => {
-                schedule::check_name("schedule owner", owner)?;
+                check_name("schedule owner", owner)?;
                 self.send_line(&format!("list-schedules {owner}")).await?;
             }
             None => self.send_line("list-schedules").await?,
@@ -384,8 +398,8 @@ impl TuberClient {
     /// Sends: `stats-schedule <owner> <name>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
     /// (`NOT_FOUND` comes back as the error's message, as for `stats-job`)
     pub async fn stats_schedule(&mut self, owner: &str, name: &str) -> io::Result<ScheduleStats> {
-        schedule::check_name("schedule owner", owner)?;
-        schedule::check_name("schedule name", name)?;
+        check_name("schedule owner", owner)?;
+        check_name("schedule name", name)?;
         self.send_line(&format!("stats-schedule {owner} {name}")).await?;
         let body = self.read_ok_body().await?;
         Ok(ScheduleStats::from_yaml(&body))
@@ -724,6 +738,49 @@ mod tests {
         let err = client.sync_schedules("splat", &[], false).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         drop(client);
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    fn assert_refused<T: std::fmt::Debug>(what: &str, result: io::Result<T>) {
+        let err = result.expect_err(what);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{what}: {err}");
+    }
+
+    /// A name with a CRLF in it ends the command early and sends the rest as
+    /// one of its own: `stats-tube default\r\nflush-tube victim` empties
+    /// `victim`. So every name and tag is checked before anything goes on the
+    /// wire; the server here would fail the test by hanging up on the first
+    /// command.
+    #[tokio::test]
+    async fn a_name_that_could_smuggle_a_command_sends_nothing() {
+        let (addr, server) = converse(&[]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let long = "a".repeat(201);
+        for bad in ["default\r\nflush-tube victim", "two words", "", "-leading", long.as_str()] {
+            assert_refused(&format!("stats-tube {bad:?}"), c.stats_tube(bad).await);
+            assert_refused(&format!("use {bad:?}"), c.use_tube(bad).await);
+            assert_refused(&format!("watch {bad:?}"), c.watch(bad).await);
+            assert_refused(&format!("ignore {bad:?}"), c.ignore(bad).await);
+            assert_refused(&format!("watch_only {bad:?}"), c.watch_only(bad).await);
+            assert_refused(&format!("stats-group {bad:?}"), c.stats_group(bad).await);
+            assert_refused(&format!("flush-tube {bad:?}"), c.flush_tube(bad).await);
+            assert_refused(&format!("flush-buried {bad:?}"), c.flush_buried(bad).await);
+            assert_refused(&format!("pause-tube {bad:?}"), c.pause_tube(bad, 0).await);
+        }
+        drop(c);
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    /// Tags go on the `put` line, so one with a space or a CRLF in it can add a
+    /// tag the caller never asked for, or end the line and start another.
+    #[tokio::test]
+    async fn a_tag_that_could_break_the_put_line_sends_nothing() {
+        let (addr, server) = converse(&[]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        for bad in ["grp:a\r\nflush-tube victim", "grp:a aft:b", "idp:key\0", "", "con:\x7f"] {
+            assert_refused(&format!("tag {bad:?}"), c.put_tagged(0, 0, 60, b"{}", &[bad.to_string()]).await);
+        }
+        drop(c);
         assert!(server.await.unwrap().is_empty());
     }
 

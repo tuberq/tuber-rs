@@ -9,12 +9,10 @@
 //!
 //! [`sync_schedules`]: crate::client::TuberClient::sync_schedules
 
+use crate::name::{check_name, invalid};
 use crate::parse::{get_str, get_u64, parse_yaml_map};
 use std::fmt;
 use std::io;
-
-/// Longest owner, entry or tube name tuber accepts, in bytes.
-const MAX_NAME_LEN: usize = 200;
 
 /// The tags a `schedule-put` line may carry: the four a `put` takes, which
 /// every fire carries, and `catchup:`, which is the entry's own.
@@ -88,24 +86,6 @@ impl ScheduleEntry {
         }
         Ok(())
     }
-}
-
-/// Check an owner, entry or tube name against tuber's tube-name rules: up to
-/// 200 bytes of letters, digits and `- + / ; . $ _ ( )`, not starting with `-`.
-pub(crate) fn check_name(what: &str, name: &str) -> io::Result<()> {
-    let valid_byte = |b: u8| b.is_ascii_alphanumeric() || b"-+/;.$_()".contains(&b);
-    if name.is_empty()
-        || name.len() > MAX_NAME_LEN
-        || name.starts_with('-')
-        || !name.bytes().all(valid_byte)
-    {
-        return Err(invalid(format!("invalid {what} {name:?}")));
-    }
-    Ok(())
-}
-
-fn invalid(msg: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
 /// Check a whole sync before any of it is sent: every entry valid, no name
