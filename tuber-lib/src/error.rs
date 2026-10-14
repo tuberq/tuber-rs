@@ -55,7 +55,8 @@ pub enum Error {
     /// `UNKNOWN_COMMAND`: the server doesn't have this command; an older
     /// tuber, or beanstalkd for a tuber extension.
     UnknownCommand,
-    /// `EXPECTED_CRLF`: a put body wasn't followed by CRLF.
+    /// `EXPECTED_CRLF`: a put body wasn't followed by CRLF. Tuber closes the
+    /// connection after it, so this one of its replies is fatal.
     ExpectedCrlf,
     /// `NOT_IGNORED`: `ignore` would have left the connection watching no
     /// tube.
@@ -110,7 +111,10 @@ impl Error {
 
     /// True when this error closed the connection: reconnect to go on.
     pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::Io(_) | Self::Timeout | Self::Protocol(_) | Self::Closed)
+        matches!(
+            self,
+            Self::Io(_) | Self::Timeout | Self::Protocol(_) | Self::Closed | Self::ExpectedCrlf
+        )
     }
 }
 
@@ -128,11 +132,14 @@ impl fmt::Display for Error {
     }
 }
 
+/// `Io` and `ScheduleSync` print their inner error as their own message, so
+/// they pass on its source rather than the error itself, which would say it
+/// twice in a chain.
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
-            Self::ScheduleSync(e) => Some(e),
+            Self::Io(e) => e.source(),
+            Self::ScheduleSync(e) => e.source(),
             _ => None,
         }
     }
@@ -150,5 +157,37 @@ impl From<Error> for io::Error {
             _ => io::ErrorKind::Other,
         };
         io::Error::new(kind, e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    /// Each message in the chain, as anyhow's `{:#}` prints it.
+    fn chain(err: &Error) -> Vec<String> {
+        let mut messages = vec![err.to_string()];
+        let mut source = err.source();
+        while let Some(e) = source {
+            messages.push(e.to_string());
+            source = e.source();
+        }
+        messages
+    }
+
+    /// A wrapper that prints its inner error and also returns it as the
+    /// source says everything twice: tuber-cli printed "Connection refused
+    /// (os error 111): Connection refused (os error 111)".
+    #[test]
+    fn each_message_is_said_once() {
+        let io = Error::Io(io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused"));
+        assert_eq!(chain(&io), ["Connection refused"]);
+        let sync = Error::ScheduleSync(ScheduleSyncError {
+            owner: "splat".into(),
+            entry: Some("rollup".into()),
+            status: "BAD_SCHEDULE".into(),
+        });
+        assert_eq!(chain(&sync).len(), 1, "{:?}", chain(&sync));
     }
 }

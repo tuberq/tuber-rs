@@ -119,6 +119,11 @@ impl ReserveMode {
     }
 }
 
+/// The longest body a reply may announce: tuber's ceiling on a job's size,
+/// which `-z` can't raise. A longer one is a protocol error rather than an
+/// allocation.
+const MAX_BODY: usize = 1 << 30;
+
 /// The largest weight [`TuberClient::watch_weighted`] takes.
 pub const MAX_WATCH_WEIGHT: u32 = 9999;
 
@@ -402,14 +407,16 @@ impl TuberClient {
         self.read_u64_response("WATCHING").await
     }
 
-    /// Watch only `tube` for subsequent reserves: watch it, then ignore the
-    /// `default` tube (unless `tube` is itself `default`). `reserve` and
+    /// Watch only `tube` for subsequent reserves: watch it, then ignore every
+    /// other tube the connection watches, `default` included. `reserve` and
     /// `reserve-batch` pull from the watch list — not the used tube — so this
     /// is how you target a specific tube for reserving.
     pub async fn watch_only(&mut self, tube: &str) -> Result<()> {
         self.watch(tube).await?;
-        if tube != "default" {
-            self.ignore("default").await?;
+        for other in self.list_tubes_watched().await? {
+            if other != tube {
+                self.ignore(&other).await?;
+            }
         }
         Ok(())
     }
@@ -751,11 +758,25 @@ impl TuberClient {
         }
     }
 
-    /// Read a `bytes`-long body and the CRLF that must follow it.
+    /// Read a `bytes`-long body and the CRLF that must follow it. The buffer
+    /// grows as the bytes arrive, so a length is never allocated on the
+    /// server's word alone.
     async fn read_body(&mut self, bytes: usize) -> Result<Vec<u8>> {
-        let mut body = vec![0u8; bytes + 2];
-        match within(self.deadline, self.reader.read_exact(&mut body)).await {
-            Some(Ok(_)) => {}
+        if bytes > MAX_BODY {
+            return Err(self.protocol(format!("a {bytes}-byte body, past any job's size")).await);
+        }
+        let mut body = Vec::with_capacity(bytes.min(64 * 1024) + 2);
+        let deadline = self.deadline;
+        let read = {
+            let mut rest = (&mut self.reader).take(bytes as u64 + 2);
+            within(deadline, rest.read_to_end(&mut body)).await
+        };
+        match read {
+            Some(Ok(n)) if n == bytes + 2 => {}
+            Some(Ok(_)) => {
+                let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-body");
+                return Err(self.close(Error::Io(eof)).await);
+            }
             Some(Err(e)) => return Err(self.close(Error::Io(e)).await),
             None => return Err(self.close(Error::Timeout).await),
         }
@@ -780,6 +801,8 @@ impl TuberClient {
     /// it is a protocol error, and closes the connection.
     async fn refusal(&mut self, line: String) -> Error {
         match Error::from_reply(&line) {
+            // EXPECTED_CRLF: tuber has closed its end.
+            Some(e) if e.is_fatal() => self.close(e).await,
             Some(e) => e,
             None => self.protocol(format!("unexpected reply {line:?}")).await,
         }
@@ -905,8 +928,8 @@ mod tests {
 
     /// A one-connection server that answers the n-th command with
     /// `replies[n]`, and hangs up on a command past the last. Its handle
-    /// yields every line it was sent, with a `schedule-put`'s body as the line
-    /// after it, so it resolves once the client hangs up too.
+    /// yields every line it was sent, with a `put`'s or `schedule-put`'s body
+    /// as the line after it, so it resolves once the client hangs up too.
     async fn converse(replies: &'static [&'static [u8]]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -922,8 +945,14 @@ mod tests {
                     break;
                 }
                 let line = line.trim_end().to_string();
-                if line.starts_with("schedule-put ") {
-                    let n: usize = line.split_whitespace().nth(6).unwrap().parse().unwrap();
+                // `<bytes>` is put's 5th word and schedule-put's 7th.
+                let bytes_at = match line.split_whitespace().next() {
+                    Some("put") => Some(4),
+                    Some("schedule-put") => Some(6),
+                    _ => None,
+                };
+                if let Some(i) = bytes_at {
+                    let n: usize = line.split_whitespace().nth(i).unwrap().parse().unwrap();
                     let mut body = vec![0u8; n + 2];
                     r.read_exact(&mut body).await.unwrap();
                     body.truncate(n);
@@ -1338,6 +1367,61 @@ mod tests {
         }
         drop(c);
         assert!(server.await.unwrap().is_empty());
+    }
+
+    /// A body length is the server's word, and a lying or broken server
+    /// once made the client allocate it whole: `FOUND 1 99999999999` asked
+    /// for 100 GB and aborted. A length past tuber's 1 GiB job limit is a
+    /// protocol error, and one at the top of u64 can't wrap the `+ 2` for
+    /// the CRLF.
+    #[tokio::test]
+    async fn a_body_length_past_any_job_is_refused_not_allocated() {
+        for reply in [&b"FOUND 1 99999999999"[..], b"FOUND 1 18446744073709551615", b"OK 99999999999"] {
+            let replies: &'static [&'static [u8]] = Box::leak(vec![reply].into_boxed_slice());
+            let (addr, _server) = converse(replies).await;
+            let mut c = TuberClient::connect(&addr).await.unwrap();
+            let what = String::from_utf8_lossy(reply);
+            let err = if reply.starts_with(b"OK") {
+                c.stats().await.map(|_| ()).unwrap_err()
+            } else {
+                c.peek(1).await.map(|_| ()).unwrap_err()
+            };
+            assert!(matches!(err, Error::Protocol(_)), "{what}: {err:?}");
+        }
+    }
+
+    /// tuber closes the connection after EXPECTED_CRLF, so the client must
+    /// count it as closed rather than send the next command into it.
+    #[tokio::test]
+    async fn expected_crlf_closes_the_connection() {
+        let (addr, server) = converse(&[b"EXPECTED_CRLF", b"OK 4\r\n---\n"]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let err = c.put(0, 0, 60, b"x").await.unwrap_err();
+        assert!(matches!(err, Error::ExpectedCrlf) && err.is_fatal(), "{err:?}");
+        assert!(matches!(c.stats().await.unwrap_err(), Error::Closed));
+        drop(c);
+        assert_eq!(server.await.unwrap(), ["put 0 0 60 1", "x"]);
+    }
+
+    /// `watch_only` is "reserve from this tube and no other". On a client
+    /// that watched other tubes before, ignoring only `default` left them
+    /// watched.
+    #[tokio::test]
+    async fn watch_only_ignores_every_other_tube() {
+        let (addr, server) = converse(&[
+            b"WATCHING 3",
+            b"OK 29\r\n---\n- default\n- old\n- emails\n",
+            b"WATCHING 2",
+            b"WATCHING 1",
+        ])
+        .await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        c.watch_only("emails").await.unwrap();
+        drop(c);
+        assert_eq!(
+            server.await.unwrap(),
+            ["watch emails", "list-tubes-watched", "ignore default", "ignore old"]
+        );
     }
 
     #[tokio::test]

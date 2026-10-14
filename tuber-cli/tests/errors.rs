@@ -65,6 +65,9 @@ fn no_server_exits_6() {
     let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
     let (err, code) = failure(&run_at(&addr, &["stats"]));
     assert_eq!((err["error"].as_str(), code), (Some("UNREACHABLE"), Some(6)), "{err}");
+    // Said once, not "Connection refused: Connection refused".
+    let message = err["message"].as_str().unwrap();
+    assert_eq!(message.matches("onnection refused").count(), 1, "{message}");
 }
 
 #[test]
