@@ -3,7 +3,7 @@ members = ["tuber-lib", "tuber-tui", "tuber-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.18.0"
+version = "0.18.1"
 edition = "2021"
 # ratatui's dependencies need 1.88; clap alone would need 1.85.
 rust-version = "1.88"
@@ -14,7 +14,7 @@ readme = "README.md"
 [workspace.dependencies]
 # The version is what a packaged tuber-cli or tuber-tui asks for, so it moves
 # with [workspace.package] version above.
-tuber-lib = { path = "tuber-lib", version = "0.18.0" }
+tuber-lib = { path = "tuber-lib", version = "0.18.1" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
