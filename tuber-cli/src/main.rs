@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
-use tuber_lib::client::{Job, TuberClient};
+use tuber_lib::{Job, Reserved, TuberClient};
 
 mod schedule_file;
 
@@ -335,8 +335,11 @@ async fn main() -> anyhow::Result<()> {
             if let Some(tube) = tube {
                 client.watch_only(&tube).await?;
             }
-            let job = client.reserve(timeout).await?;
-            output(&cli.format, &job_json(&job))?;
+            match client.reserve_with_timeout(timeout).await? {
+                Reserved::Job(job) => output(&cli.format, &job_json(&job))?,
+                Reserved::TimedOut => anyhow::bail!("TIMED_OUT"),
+                Reserved::DeadlineSoon => anyhow::bail!("DEADLINE_SOON"),
+            }
         }
 
         Command::ReserveBatch { count, timeout, tube } => {

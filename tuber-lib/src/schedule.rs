@@ -9,10 +9,10 @@
 //!
 //! [`sync_schedules`]: crate::client::TuberClient::sync_schedules
 
+use crate::error::Result;
 use crate::name::{check_name, invalid};
 use crate::parse::{get_str, get_u64, parse_yaml_map};
 use std::fmt;
-use std::io;
 
 /// The tags a `schedule-put` line may carry: the four a `put` takes, which
 /// every fire carries, and `catchup:`, which is the entry's own.
@@ -60,7 +60,7 @@ impl ScheduleEntry {
     /// Refuse, before anything is sent, what tuber would refuse as
     /// `BAD_FORMAT` or misread: names outside tube-name rules, tags without a
     /// known prefix, and specs that would break the line.
-    fn validate(&self) -> io::Result<()> {
+    fn validate(&self) -> Result<()> {
         check_name("schedule name", &self.name)?;
         check_name(&format!("tube of schedule {}", self.name), &self.tube)?;
         for tag in &self.tags {
@@ -90,7 +90,7 @@ impl ScheduleEntry {
 
 /// Check a whole sync before any of it is sent: every entry valid, no name
 /// twice, and no empty set unless the caller means it.
-pub(crate) fn validate_sync(owner: &str, entries: &[ScheduleEntry], allow_empty: bool) -> io::Result<()> {
+pub(crate) fn validate_sync(owner: &str, entries: &[ScheduleEntry], allow_empty: bool) -> Result<()> {
     check_name("schedule owner", owner)?;
     if entries.is_empty() && !allow_empty {
         return Err(invalid(format!(
@@ -143,9 +143,8 @@ impl SyncResult {
     }
 }
 
-/// Why a sync didn't take. [`sync_schedules`] returns it inside an
-/// [`io::Error`]; reach it with
-/// `err.get_ref().and_then(|e| e.downcast_ref::<ScheduleSyncError>())`.
+/// Why a sync didn't take. [`sync_schedules`] returns it as
+/// [`Error::ScheduleSync`](crate::Error::ScheduleSync).
 ///
 /// Nothing changed unless [`is_live`](Self::is_live) says otherwise.
 ///
@@ -327,7 +326,7 @@ mod tests {
         ];
         for (what, e) in cases {
             let err = e.validate().expect_err(what);
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{what}");
+            assert!(matches!(err, crate::Error::InvalidInput(_)), "{what}: {err:?}");
         }
     }
 

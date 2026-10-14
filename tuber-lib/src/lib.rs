@@ -1,8 +1,49 @@
+//! An async client for [tuber](https://github.com/tuberq/tuber), the
+//! beanstalkd-compatible work queue, and its extensions: idempotent puts,
+//! groups, concurrency limits and recurring schedules.
+//!
+//! ```no_run
+//! use tuber_lib::{tag, Reserved, TuberClient};
+//!
+//! # async fn handle(_body: &[u8]) -> Result<(), ()> { Ok(()) }
+//! # async fn run() -> tuber_lib::Result<()> {
+//! let mut client = TuberClient::connect("localhost:11300").await?;
+//!
+//! // Produce
+//! client.use_tube("emails").await?;
+//! let tags = [tag::idp("welcome-42")?, tag::concurrency_limit("user-42", 3)?];
+//! let put = client.put_tagged(1024, 0, 120, b"send welcome", &tags).await?;
+//!
+//! // Consume
+//! client.watch_only("emails").await?;
+//! loop {
+//!     match client.reserve_with_timeout(5).await? {
+//!         Reserved::Job(job) => match handle(&job.body).await {
+//!             Ok(()) => client.delete(job.id).await?,
+//!             Err(_) => client.release(job.id, 1024, 30).await?,
+//!         },
+//!         Reserved::TimedOut => continue,
+//!         // A job this connection holds is about to run out of TTR.
+//!         Reserved::DeadlineSoon => _ = client.touch_all().await?,
+//!     }
+//! }
+//! # }
+//! ```
+//!
+//! Errors are [`Error`]s. Tuber's refusals leave the connection usable; an
+//! I/O error, a timeout or a reply the client can't read closes it (see
+//! [`Error::is_fatal`]).
+
 pub mod client;
+mod error;
 pub mod model;
 mod name;
 pub mod parse;
 pub mod schedule;
+
+pub use client::{Job, PutResult, ReserveMode, Reserved, TuberClient};
+pub use name::tag;
+pub use error::{Error, Result};
 
 const DEFAULT_HOST: &str = "localhost";
 const DEFAULT_PORT: &str = "11300";

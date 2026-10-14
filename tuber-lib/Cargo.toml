@@ -12,3 +12,6 @@ optional = true
 
 [features]
 serde = ["dep:serde"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

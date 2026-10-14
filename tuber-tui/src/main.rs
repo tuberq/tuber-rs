@@ -10,7 +10,6 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
-use std::io;
 use std::io::stdout;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -247,7 +246,7 @@ fn prompt_command(
 /// *used* tube rather than taking one as an argument, which is why commands get
 /// their own connection: doing this on the poller's would leave it reserving
 /// from whichever tube was last kicked.
-async fn run_command(client: &mut TuberClient, command: &Command) -> io::Result<String> {
+async fn run_command(client: &mut TuberClient, command: &Command) -> tuber_lib::Result<String> {
     match command {
         Command::Pause { tube, delay } => {
             client.pause_tube(tube, *delay).await?;
@@ -285,7 +284,7 @@ async fn run_command(client: &mut TuberClient, command: &Command) -> io::Result<
 /// poll interval.
 fn spawn_command(addr: String, command: Command, tx: mpsc::Sender<PollMsg>) {
     tokio::spawn(async move {
-        let result: io::Result<(String, Snapshot)> = async {
+        let result: tuber_lib::Result<(String, Snapshot)> = async {
             let mut client = TuberClient::connect(&addr).await?;
             let msg = run_command(&mut client, &command).await?;
             Ok((msg, client.fetch_snapshot().await?))

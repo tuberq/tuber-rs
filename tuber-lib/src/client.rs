@@ -1,19 +1,32 @@
+use crate::error::{Error, Result};
 use crate::model::{GroupStats, JobStats, ServerStats, Snapshot, TubeStats};
 use crate::name::{check_name, check_tag};
 use crate::parse::parse_yaml_list;
 use crate::schedule::{self, ScheduleEntry, ScheduleStats, ScheduleSyncError, SyncResult};
+use std::future::Future;
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+/// How long [`TuberClient::connect`] waits to connect, and then for each reply.
+/// A reserve that asks the server to wait gets that long on top.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Outcome of a `put`. When `existing_state` is `Some`, an `idp:` key matched
 /// a job that was already there: nothing was enqueued, `id` is that job's id,
 /// and the state is where it currently sits (`READY`, `BURIED`, `DELETED`, …).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PutResult {
     pub id: u64,
     pub existing_state: Option<String>,
+    /// When an `idp:` key matched a job less urgent than this put: that job's
+    /// priority, raised to this put's. `None` when nothing was raised.
+    pub raised_pri: Option<u32>,
+    /// The server buried the new job on arrival, as beanstalkd does when it
+    /// is out of memory (`BURIED <id>`). The job exists, and runs once kicked.
+    pub buried: bool,
 }
 
 impl PutResult {
@@ -25,21 +38,25 @@ impl PutResult {
 
 /// Parse a `put` reply. `INSERTED <id>` is a fresh insert; a trailing state
 /// (`INSERTED <id> <state> [<pri>]`) means an `idp:` key matched an existing
-/// job and nothing was enqueued.
-fn parse_inserted(line: &str) -> io::Result<PutResult> {
-    let Some(rest) = line.strip_prefix("INSERTED ") else {
-        return Err(io::Error::other(line.to_string()));
+/// job and nothing was enqueued. `BURIED <id>` is a fresh insert buried on
+/// arrival. `None` for any other reply.
+fn parse_inserted(line: &str) -> Option<PutResult> {
+    let (buried, rest) = match line.split_once(' ')? {
+        ("INSERTED", rest) => (false, rest),
+        ("BURIED", rest) => (true, rest),
+        _ => return None,
     };
     let mut fields = rest.split_whitespace();
-    let id: u64 = fields
-        .next()
-        .unwrap_or_default()
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(PutResult {
-        id,
-        existing_state: fields.next().map(str::to_string),
-    })
+    let id: u64 = fields.next()?.parse().ok()?;
+    if buried {
+        return Some(PutResult { id, existing_state: None, raised_pri: None, buried });
+    }
+    let existing_state = fields.next().map(str::to_string);
+    let raised_pri = match fields.next() {
+        Some(pri) => Some(pri.parse().ok()?),
+        None => None,
+    };
+    Some(PutResult { id, existing_state, raised_pri, buried })
 }
 
 /// A reserved or peeked job. The body is bytes, exactly as put: tuber doesn't
@@ -57,42 +74,123 @@ impl Job {
     }
 }
 
+/// What a reserve came back with. Only [`Job`](Self::Job) holds a
+/// reservation; the others are answers, not failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reserved {
+    Job(Job),
+    /// `TIMED_OUT`: no job became ready within the timeout.
+    TimedOut,
+    /// `DEADLINE_SOON`: a job this connection holds is within a second of
+    /// its TTR. Nothing was reserved: finish, touch or release that job first.
+    DeadlineSoon,
+}
+
+impl Reserved {
+    /// The job, if one was reserved.
+    pub fn job(self) -> Option<Job> {
+        match self {
+            Self::Job(job) => Some(job),
+            _ => None,
+        }
+    }
+}
+
+/// How `reserve` chooses among the watched tubes, for this connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveMode {
+    /// The most urgent job across every watched tube. The default.
+    Fifo,
+    /// A tube chosen at random in proportion to its watch weight, then its
+    /// most urgent job.
+    Weighted,
+    /// As `Weighted`, but sharing worker time rather than job count: each
+    /// tube's weight is divided by how long its jobs take to run.
+    WeightedFair,
+}
+
+impl ReserveMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fifo => "fifo",
+            Self::Weighted => "weighted",
+            Self::WeightedFair => "weighted-fair",
+        }
+    }
+}
+
+/// The largest weight [`TuberClient::watch_weighted`] takes.
+pub const MAX_WATCH_WEIGHT: u32 = 9999;
+
+/// One connection to tuber.
+///
+/// Errors are [`Error`]s: tuber's refusals leave the connection usable, and
+/// an I/O, timeout or framing error closes it (see [`Error::is_fatal`]).
 pub struct TuberClient {
     reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
     writer: tokio::net::tcp::OwnedWriteHalf,
+    /// Set by a fatal error. The socket has been shut, and every call fails
+    /// with [`Error::Closed`] without sending anything.
+    closed: bool,
+    /// How long a command may take; `None` waits as long as it takes.
+    timeout: Option<Duration>,
+    /// When the command in flight gives up, set as it is sent.
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl TuberClient {
-    pub async fn connect(addr: &str) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
+    /// Connect, waiting at most [`DEFAULT_TIMEOUT`] to connect and then for
+    /// each reply.
+    pub async fn connect(addr: &str) -> Result<Self> {
+        Self::connect_with_timeout(addr, Some(DEFAULT_TIMEOUT)).await
+    }
+
+    /// Connect, waiting at most `timeout` to connect and then for each reply;
+    /// `None` waits as long as it takes.
+    pub async fn connect_with_timeout(addr: &str, timeout: Option<Duration>) -> Result<Self> {
+        let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+        let stream = match within(deadline, TcpStream::connect(addr)).await {
+            Some(stream) => stream.map_err(Error::Io)?,
+            None => return Err(Error::Timeout),
+        };
+        stream.set_nodelay(true).map_err(Error::Io)?;
         let (reader, writer) = stream.into_split();
         Ok(Self {
             reader: BufReader::new(reader),
             writer,
+            closed: false,
+            timeout,
+            deadline: None,
         })
     }
 
-    pub async fn stats(&mut self) -> io::Result<ServerStats> {
+    /// Change how long each later command may take; `None` waits as long as
+    /// it takes. A reply that misses its deadline is [`Error::Timeout`], and
+    /// closes the connection.
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
+    }
+
+    pub async fn stats(&mut self) -> Result<ServerStats> {
         self.send_line("stats").await?;
         let body = self.read_ok_body().await?;
         Ok(ServerStats::from_yaml(&body))
     }
 
-    pub async fn list_tubes(&mut self) -> io::Result<Vec<String>> {
+    pub async fn list_tubes(&mut self) -> Result<Vec<String>> {
         self.send_line("list-tubes").await?;
         let body = self.read_ok_body().await?;
         Ok(parse_yaml_list(&body))
     }
 
-    pub async fn stats_tube(&mut self, tube: &str) -> io::Result<TubeStats> {
+    pub async fn stats_tube(&mut self, tube: &str) -> Result<TubeStats> {
         check_name("tube name", tube)?;
         self.send_line(&format!("stats-tube {tube}")).await?;
         let body = self.read_ok_body().await?;
         Ok(TubeStats::from_yaml(&body))
     }
 
-    pub async fn fetch_snapshot(&mut self) -> io::Result<Snapshot> {
+    pub async fn fetch_snapshot(&mut self) -> Result<Snapshot> {
         let server = self.stats().await?;
         let tube_names = self.list_tubes().await?;
         let mut tubes = Vec::with_capacity(tube_names.len());
@@ -105,7 +203,7 @@ impl TuberClient {
             match self.stats_tube(name).await {
                 Ok(tube) => tubes.push(tube),
                 // Emptied, and so gone, since list-tubes named it.
-                Err(e) if e.to_string() == "NOT_FOUND" => {}
+                Err(Error::NotFound) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -121,20 +219,19 @@ impl TuberClient {
 
     /// Switch to a tube for subsequent put commands.
     /// Sends: `use <tube>\r\n` — expects: `USING <tube>\r\n`
-    pub async fn use_tube(&mut self, tube: &str) -> io::Result<String> {
+    pub async fn use_tube(&mut self, tube: &str) -> Result<String> {
         check_name("tube name", tube)?;
         self.send_line(&format!("use {tube}")).await?;
         let line = self.read_line().await?;
-        if let Some(name) = line.strip_prefix("USING ") {
-            Ok(name.to_string())
-        } else {
-            Err(io::Error::other(line))
+        match line.strip_prefix("USING ") {
+            Some(name) => Ok(name.to_string()),
+            None => Err(self.refusal(line).await),
         }
     }
 
     /// Put a job into the currently used tube.
     /// Sends: `put <pri> <delay> <ttr> <bytes>\r\n<data>\r\n` — expects: `INSERTED <id>\r\n`
-    pub async fn put(&mut self, priority: u32, delay: u32, ttr: u32, data: &[u8]) -> io::Result<u64> {
+    pub async fn put(&mut self, priority: u32, delay: u32, ttr: u32, data: &[u8]) -> Result<u64> {
         Ok(self.put_tagged(priority, delay, ttr, data, &[]).await?.id)
     }
 
@@ -154,6 +251,9 @@ impl TuberClient {
     /// Expects `INSERTED <id>\r\n` for a fresh job, or `INSERTED <id> <state>
     /// [<pri>]\r\n` when an `idp:` key matched — in which case nothing was
     /// enqueued and the id is the *existing* job's. See [`PutResult`].
+    ///
+    /// [`Error::InternalError`] means the job wasn't queued, but may come back
+    /// after a tuber restart: retry with an `idp:` key.
     pub async fn put_tagged(
         &mut self,
         priority: u32,
@@ -161,7 +261,7 @@ impl TuberClient {
         ttr: u32,
         data: &[u8],
         tags: &[String],
-    ) -> io::Result<PutResult> {
+    ) -> Result<PutResult> {
         for tag in tags {
             check_tag(tag)?;
         }
@@ -171,25 +271,42 @@ impl TuberClient {
             cmd.push_str(tag);
         }
         cmd.push_str("\r\n");
-        self.writer.write_all(cmd.as_bytes()).await?;
-        self.writer.write_all(data).await?;
-        self.writer.write_all(b"\r\n").await?;
-        self.writer.flush().await?;
+        // One buffer, so the job goes out in one write.
+        let mut frame = cmd.into_bytes();
+        frame.extend_from_slice(data);
+        frame.extend_from_slice(b"\r\n");
+        self.send(&frame).await?;
         let line = self.read_line().await?;
-        parse_inserted(&line)
+        match parse_inserted(&line) {
+            Some(put) => Ok(put),
+            None => Err(self.refusal(line).await),
+        }
     }
 
-    /// Reserve the next available job, waiting up to `timeout` seconds.
-    /// Sends: `reserve-with-timeout <seconds>\r\n` — expects: `RESERVED <id> <bytes>\r\n<data>\r\n`
-    pub async fn reserve(&mut self, timeout: u32) -> io::Result<Job> {
+    /// Reserve the next job from the watched tubes, waiting as long as it
+    /// takes. Only [`Reserved::DeadlineSoon`] ends the wait without a job.
+    /// Sends: `reserve\r\n` — expects: `RESERVED <id> <bytes>\r\n<data>\r\n`
+    pub async fn reserve(&mut self) -> Result<Reserved> {
+        self.send_line("reserve").await?;
+        // No deadline: the reply comes when a job does.
+        self.deadline = None;
+        self.read_reserved().await
+    }
+
+    /// Reserve the next job from the watched tubes, waiting up to `timeout`
+    /// seconds; 0 returns at once.
+    /// Sends: `reserve-with-timeout <seconds>\r\n` — expects:
+    /// `RESERVED <id> <bytes>\r\n<data>\r\n`, `TIMED_OUT` or `DEADLINE_SOON`
+    pub async fn reserve_with_timeout(&mut self, timeout: u32) -> Result<Reserved> {
         self.send_line(&format!("reserve-with-timeout {timeout}")).await?;
-        self.read_job_response("RESERVED").await
+        self.wait_longer(timeout);
+        self.read_reserved().await
     }
 
     /// Reserve one specific job by ID, regardless of tube or watch list. The
     /// job must be ready, delayed, or buried — not already reserved.
     /// Sends: `reserve-job <id>\r\n` — expects: `RESERVED <id> <bytes>\r\n<data>\r\n`
-    pub async fn reserve_job(&mut self, id: u64) -> io::Result<Job> {
+    pub async fn reserve_job(&mut self, id: u64) -> Result<Job> {
         self.send_line(&format!("reserve-job {id}")).await?;
         self.read_job_response("RESERVED").await
     }
@@ -198,39 +315,88 @@ impl TuberClient {
     /// where `n > 0`, blocks up to `n` seconds for at least one job to appear;
     /// `None` or `Some(0)` returns immediately (possibly empty). Reserves from
     /// the watch list, so use [`watch_only`](Self::watch_only) to target a tube.
+    /// [`Error::DeadlineSoon`] means a job already held is about to run out of
+    /// TTR: [`touch_all`](Self::touch_all), then reserve again.
     /// Sends: `reserve-batch <count> [timeout]\r\n`
     /// Expects: `RESERVED_BATCH <n>\r\n` then n × `RESERVED <id> <bytes>\r\n<data>\r\n`
-    pub async fn reserve_batch(&mut self, count: u32, timeout: Option<u32>) -> io::Result<Vec<Job>> {
+    pub async fn reserve_batch(&mut self, count: u32, timeout: Option<u32>) -> Result<Vec<Job>> {
         let cmd = match timeout {
             Some(t) => format!("reserve-batch {count} {t}"),
             None => format!("reserve-batch {count}"),
         };
         self.send_line(&cmd).await?;
+        self.wait_longer(timeout.unwrap_or(0));
         let line = self.read_line().await?;
-        let n: usize = line
-            .strip_prefix("RESERVED_BATCH ")
-            .ok_or_else(|| io::Error::other(line.clone()))?
-            .trim()
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if line == "DEADLINE_SOON" {
+            return Err(Error::DeadlineSoon);
+        }
+        let Some(n) = line.strip_prefix("RESERVED_BATCH ") else {
+            return Err(self.refusal(line).await);
+        };
+        let n: usize = self.parse_field(n, &line).await?;
         let mut jobs = Vec::with_capacity(n);
         for _ in 0..n {
-            jobs.push(self.read_job_response("RESERVED").await?);
+            // Every job is read, whatever its body: one left on the wire
+            // would be read as the next command's reply.
+            let line = self.read_line().await?;
+            jobs.push(self.read_job_body("RESERVED", &line).await?);
         }
         Ok(jobs)
     }
 
     /// Add a tube to the watch set for subsequent reserves.
     /// Sends: `watch <tube>\r\n` — expects: `WATCHING <count>\r\n`
-    pub async fn watch(&mut self, tube: &str) -> io::Result<u64> {
+    pub async fn watch(&mut self, tube: &str) -> Result<u64> {
         check_name("tube name", tube)?;
         self.send_line(&format!("watch {tube}")).await?;
         self.read_u64_response("WATCHING").await
     }
 
+    /// Watch a tube with a weight, for the weighted [`ReserveMode`]s: a tube
+    /// of weight 6 is chosen three times as often as one of weight 2. Tubes
+    /// watched without one weigh 1. Weights run 1 to [`MAX_WATCH_WEIGHT`].
+    /// Sends: `watch <tube> <weight>\r\n` — expects: `WATCHING <count>\r\n`
+    pub async fn watch_weighted(&mut self, tube: &str, weight: u32) -> Result<u64> {
+        check_name("tube name", tube)?;
+        if !(1..=MAX_WATCH_WEIGHT).contains(&weight) {
+            return Err(Error::InvalidInput(format!(
+                "watch weight {weight} is outside 1 to {MAX_WATCH_WEIGHT}"
+            )));
+        }
+        self.send_line(&format!("watch {tube} {weight}")).await?;
+        self.read_u64_response("WATCHING").await
+    }
+
+    /// The tubes this connection watches.
+    /// Sends: `list-tubes-watched\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
+    pub async fn list_tubes_watched(&mut self) -> Result<Vec<String>> {
+        self.send_line("list-tubes-watched").await?;
+        let body = self.read_ok_body().await?;
+        Ok(parse_yaml_list(&body))
+    }
+
+    /// The tube this connection puts into.
+    /// Sends: `list-tube-used\r\n` — expects: `USING <tube>\r\n`
+    pub async fn list_tube_used(&mut self) -> Result<String> {
+        self.send_line("list-tube-used").await?;
+        let line = self.read_line().await?;
+        match line.strip_prefix("USING ") {
+            Some(name) => Ok(name.to_string()),
+            None => Err(self.refusal(line).await),
+        }
+    }
+
+    /// Choose how this connection's reserves pick among its watched tubes.
+    /// Sends: `reserve-mode <mode>\r\n` — expects: `USING <mode>\r\n`
+    pub async fn reserve_mode(&mut self, mode: ReserveMode) -> Result<()> {
+        self.send_line(&format!("reserve-mode {}", mode.as_str())).await?;
+        self.expect_response(&format!("USING {}", mode.as_str())).await
+    }
+
     /// Remove a tube from the watch set.
-    /// Sends: `ignore <tube>\r\n` — expects: `WATCHING <count>\r\n` (or `NOT_IGNORED` if it was the last)
-    pub async fn ignore(&mut self, tube: &str) -> io::Result<u64> {
+    /// Sends: `ignore <tube>\r\n` — expects: `WATCHING <count>\r\n`
+    /// ([`Error::NotIgnored`] if it was the last)
+    pub async fn ignore(&mut self, tube: &str) -> Result<u64> {
         check_name("tube name", tube)?;
         self.send_line(&format!("ignore {tube}")).await?;
         self.read_u64_response("WATCHING").await
@@ -240,7 +406,7 @@ impl TuberClient {
     /// `default` tube (unless `tube` is itself `default`). `reserve` and
     /// `reserve-batch` pull from the watch list — not the used tube — so this
     /// is how you target a specific tube for reserving.
-    pub async fn watch_only(&mut self, tube: &str) -> io::Result<()> {
+    pub async fn watch_only(&mut self, tube: &str) -> Result<()> {
         self.watch(tube).await?;
         if tube != "default" {
             self.ignore("default").await?;
@@ -250,21 +416,21 @@ impl TuberClient {
 
     /// Delete a job by ID.
     /// Sends: `delete <id>\r\n` — expects: `DELETED\r\n`
-    pub async fn delete(&mut self, id: u64) -> io::Result<()> {
+    pub async fn delete(&mut self, id: u64) -> Result<()> {
         self.send_line(&format!("delete {id}")).await?;
         self.expect_response("DELETED").await
     }
 
     /// Kick at most `bound` buried or delayed jobs in the currently used tube.
     /// Sends: `kick <bound>\r\n` — expects: `KICKED <count>\r\n`
-    pub async fn kick(&mut self, bound: u32) -> io::Result<u64> {
+    pub async fn kick(&mut self, bound: u32) -> Result<u64> {
         self.send_line(&format!("kick {bound}")).await?;
         self.read_u64_response("KICKED").await
     }
 
     /// Kick one specific buried or delayed job back to ready.
     /// Sends: `kick-job <id>\r\n` — expects: `KICKED\r\n`
-    pub async fn kick_job(&mut self, id: u64) -> io::Result<()> {
+    pub async fn kick_job(&mut self, id: u64) -> Result<()> {
         self.send_line(&format!("kick-job {id}")).await?;
         self.expect_response("KICKED").await
     }
@@ -273,46 +439,52 @@ impl TuberClient {
     /// in-flight work is allowed to finish. Server-wide and persistent until
     /// [`undrain`](Self::undrain). Also triggered by `SIGUSR1`.
     /// Sends: `drain\r\n` — expects: `DRAINING\r\n`
-    pub async fn drain(&mut self) -> io::Result<()> {
+    pub async fn drain(&mut self) -> Result<()> {
         self.send_line("drain").await?;
         self.expect_response("DRAINING").await
     }
 
     /// Leave drain mode and resume accepting `put`s. Idempotent.
     /// Sends: `undrain\r\n` — expects: `NOT_DRAINING\r\n`
-    pub async fn undrain(&mut self) -> io::Result<()> {
+    pub async fn undrain(&mut self) -> Result<()> {
         self.send_line("undrain").await?;
         self.expect_response("NOT_DRAINING").await
     }
 
     /// Peek at a job by ID without reserving it.
     /// Sends: `peek <id>\r\n` — expects: `FOUND <id> <bytes>\r\n<data>\r\n`
-    pub async fn peek(&mut self, id: u64) -> io::Result<Job> {
+    pub async fn peek(&mut self, id: u64) -> Result<Job> {
         self.send_line(&format!("peek {id}")).await?;
         self.read_job_response("FOUND").await
     }
 
     /// Peek at the next ready job in the currently used tube.
-    pub async fn peek_ready(&mut self) -> io::Result<Job> {
+    pub async fn peek_ready(&mut self) -> Result<Job> {
         self.send_line("peek-ready").await?;
         self.read_job_response("FOUND").await
     }
 
     /// Peek at the next buried job in the currently used tube.
-    pub async fn peek_buried(&mut self) -> io::Result<Job> {
+    pub async fn peek_buried(&mut self) -> Result<Job> {
         self.send_line("peek-buried").await?;
         self.read_job_response("FOUND").await
     }
 
     /// Peek at the next delayed job in the currently used tube.
-    pub async fn peek_delayed(&mut self) -> io::Result<Job> {
+    pub async fn peek_delayed(&mut self) -> Result<Job> {
         self.send_line("peek-delayed").await?;
+        self.read_job_response("FOUND").await
+    }
+
+    /// Peek at a job this connection holds reserved.
+    pub async fn peek_reserved(&mut self) -> Result<Job> {
+        self.send_line("peek-reserved").await?;
         self.read_job_response("FOUND").await
     }
 
     /// Show statistics for a job by ID.
     /// Sends: `stats-job <id>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
-    pub async fn stats_job(&mut self, id: u64) -> io::Result<JobStats> {
+    pub async fn stats_job(&mut self, id: u64) -> Result<JobStats> {
         self.send_line(&format!("stats-job {id}")).await?;
         let body = self.read_ok_body().await?;
         Ok(JobStats::from_yaml(&body))
@@ -320,7 +492,7 @@ impl TuberClient {
 
     /// Show statistics for a job group.
     /// Sends: `stats-group <name>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
-    pub async fn stats_group(&mut self, name: &str) -> io::Result<GroupStats> {
+    pub async fn stats_group(&mut self, name: &str) -> Result<GroupStats> {
         check_name("group name", name)?;
         self.send_line(&format!("stats-group {name}")).await?;
         let body = self.read_ok_body().await?;
@@ -329,7 +501,7 @@ impl TuberClient {
 
     /// Flush all jobs from a tube.
     /// Sends: `flush-tube <tube>\r\n` — expects: `FLUSHED <count>\r\n`
-    pub async fn flush_tube(&mut self, tube: &str) -> io::Result<u64> {
+    pub async fn flush_tube(&mut self, tube: &str) -> Result<u64> {
         check_name("tube name", tube)?;
         self.send_line(&format!("flush-tube {tube}")).await?;
         self.read_u64_response("FLUSHED").await
@@ -338,7 +510,7 @@ impl TuberClient {
     /// Flush only the buried jobs from a tube; ready, delayed, and reserved
     /// jobs are left untouched.
     /// Sends: `flush-buried <tube>\r\n` — expects: `FLUSHED <count>\r\n`
-    pub async fn flush_buried(&mut self, tube: &str) -> io::Result<u64> {
+    pub async fn flush_buried(&mut self, tube: &str) -> Result<u64> {
         check_name("tube name", tube)?;
         self.send_line(&format!("flush-buried {tube}")).await?;
         self.read_u64_response("FLUSHED").await
@@ -346,31 +518,52 @@ impl TuberClient {
 
     /// Delete multiple jobs in a single command.
     /// Sends: `delete-batch <id1> <id2> ...\r\n` — expects: `DELETED_BATCH <deleted> <not_found>\r\n`
-    pub async fn delete_batch(&mut self, ids: &[u64]) -> io::Result<(u64, u64)> {
+    pub async fn delete_batch(&mut self, ids: &[u64]) -> Result<(u64, u64)> {
+        if ids.is_empty() {
+            return Err(Error::InvalidInput("delete-batch needs at least one id".into()));
+        }
         let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         self.send_line(&format!("delete-batch {}", id_strs.join(" "))).await?;
         let line = self.read_line().await?;
-        if let Some(rest) = line.strip_prefix("DELETED_BATCH ") {
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() == 2 {
-                let deleted: u64 = parts[0].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let not_found: u64 = parts[1].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                return Ok((deleted, not_found));
+        let Some(rest) = line.strip_prefix("DELETED_BATCH ") else {
+            return Err(self.refusal(line).await);
+        };
+        match rest.split_once(' ') {
+            Some((deleted, not_found)) => {
+                let deleted = self.parse_field(deleted, &line).await?;
+                let not_found = self.parse_field(not_found, &line).await?;
+                Ok((deleted, not_found))
             }
+            None => Err(self.protocol(format!("unexpected reply {line:?}")).await),
         }
-        Err(io::Error::other(line))
+    }
+
+    /// Put a job this connection holds back in its tube, to run again, at
+    /// `priority` and after `delay` seconds: how a worker gives up on a job
+    /// for now without burying it. [`Error::NotFound`] if this connection
+    /// doesn't hold it. [`Error::OutOfMemory`] when beanstalkd, out of
+    /// memory, buried the job instead.
+    /// Sends: `release <id> <pri> <delay>\r\n` — expects: `RELEASED\r\n`
+    pub async fn release(&mut self, id: u64, priority: u32, delay: u32) -> Result<()> {
+        self.send_line(&format!("release {id} {priority} {delay}")).await?;
+        let line = self.read_line().await?;
+        match line.as_str() {
+            "RELEASED" => Ok(()),
+            "BURIED" => Err(Error::OutOfMemory),
+            _ => Err(self.refusal(line).await),
+        }
     }
 
     /// Bury a reserved job.
     /// Sends: `bury <id> <priority>\r\n` — expects: `BURIED\r\n`
-    pub async fn bury(&mut self, id: u64, priority: u32) -> io::Result<()> {
+    pub async fn bury(&mut self, id: u64, priority: u32) -> Result<()> {
         self.send_line(&format!("bury {id} {priority}")).await?;
         self.expect_response("BURIED").await
     }
 
     /// Reset the TTR timer on a single reserved job.
     /// Sends: `touch <id>\r\n` — expects: `TOUCHED\r\n`
-    pub async fn touch(&mut self, id: u64) -> io::Result<()> {
+    pub async fn touch(&mut self, id: u64) -> Result<()> {
         self.send_line(&format!("touch {id}")).await?;
         self.expect_response("TOUCHED").await
     }
@@ -387,14 +580,14 @@ impl TuberClient {
     /// else reports that.
     ///
     /// Sends: `touch-all\r\n` — expects: `TOUCHED_ALL <n>\r\n`
-    pub async fn touch_all(&mut self) -> io::Result<u64> {
+    pub async fn touch_all(&mut self) -> Result<u64> {
         self.send_line("touch-all").await?;
         self.read_u64_response("TOUCHED_ALL").await
     }
 
     /// Pause a tube for `delay` seconds.
     /// Sends: `pause-tube <tube> <delay>\r\n` — expects: `PAUSED\r\n`
-    pub async fn pause_tube(&mut self, tube: &str, delay: u32) -> io::Result<()> {
+    pub async fn pause_tube(&mut self, tube: &str, delay: u32) -> Result<()> {
         check_name("tube name", tube)?;
         self.send_line(&format!("pause-tube {tube} {delay}")).await?;
         self.expect_response("PAUSED").await
@@ -403,7 +596,7 @@ impl TuberClient {
     /// The recurring schedule entries held, as `(owner, name)` pairs: all of
     /// them, or `owner`'s.
     /// Sends: `list-schedules [<owner>]\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
-    pub async fn list_schedules(&mut self, owner: Option<&str>) -> io::Result<Vec<(String, String)>> {
+    pub async fn list_schedules(&mut self, owner: Option<&str>) -> Result<Vec<(String, String)>> {
         match owner {
             Some(owner) => {
                 check_name("schedule owner", owner)?;
@@ -421,8 +614,8 @@ impl TuberClient {
 
     /// One schedule entry's definition, next fires, last fire and counters.
     /// Sends: `stats-schedule <owner> <name>\r\n` — expects: `OK <bytes>\r\n<yaml>\r\n`
-    /// (`NOT_FOUND` comes back as the error's message, as for `stats-job`)
-    pub async fn stats_schedule(&mut self, owner: &str, name: &str) -> io::Result<ScheduleStats> {
+    /// ([`Error::NotFound`] for no such entry)
+    pub async fn stats_schedule(&mut self, owner: &str, name: &str) -> Result<ScheduleStats> {
         check_name("schedule owner", owner)?;
         check_name("schedule name", name)?;
         self.send_line(&format!("stats-schedule {owner} {name}")).await?;
@@ -446,10 +639,9 @@ impl TuberClient {
     /// staged: re-run the whole sync on a new connection, which is safe, since
     /// an identical set changes nothing. Never resume one partway.
     ///
-    /// A refusal from tuber comes back as a [`ScheduleSyncError`] inside the
-    /// `io::Error`. Nothing changed unless its
-    /// [`is_live`](ScheduleSyncError::is_live) says the commit took but
-    /// couldn't be written to disk.
+    /// A refusal from tuber comes back as [`Error::ScheduleSync`]. Nothing
+    /// changed unless its [`is_live`](ScheduleSyncError::is_live) says the
+    /// commit took but couldn't be written to disk.
     ///
     /// Sends: `schedule-begin <owner>`, a `schedule-put` per entry framed like
     /// `put`, then `schedule-commit` — expects: `SYNCED <added> <changed>
@@ -459,10 +651,10 @@ impl TuberClient {
         owner: &str,
         entries: &[ScheduleEntry],
         allow_empty: bool,
-    ) -> io::Result<SyncResult> {
+    ) -> Result<SyncResult> {
         schedule::validate_sync(owner, entries, allow_empty)?;
         let refused = |entry: Option<&str>, status: String| {
-            io::Error::other(ScheduleSyncError {
+            Error::ScheduleSync(ScheduleSyncError {
                 owner: owner.to_string(),
                 entry: entry.map(str::to_string),
                 status,
@@ -476,8 +668,7 @@ impl TuberClient {
         }
 
         for entry in entries {
-            self.writer.write_all(&schedule::frame(entry)).await?;
-            self.writer.flush().await?;
+            self.send(&schedule::frame(entry)).await?;
             let line = self.read_line().await?;
             if line != "STAGED" {
                 // The refusal has already doomed the commit; abort now rather
@@ -498,77 +689,169 @@ impl TuberClient {
     }
 
     /// Expect a single-word response (e.g. "DELETED", "BURIED", "PAUSED").
-    async fn expect_response(&mut self, expected: &str) -> io::Result<()> {
+    async fn expect_response(&mut self, expected: &str) -> Result<()> {
         let line = self.read_line().await?;
         if line == expected {
             Ok(())
         } else {
-            Err(io::Error::other(line))
+            Err(self.refusal(line).await)
         }
     }
 
     /// Read a response with a prefix and trailing u64 (e.g. "KICKED 5").
-    async fn read_u64_response(&mut self, prefix: &str) -> io::Result<u64> {
+    async fn read_u64_response(&mut self, prefix: &str) -> Result<u64> {
         let line = self.read_line().await?;
-        if let Some(val_str) = line.strip_prefix(prefix).and_then(|s| s.strip_prefix(' ')) {
-            val_str.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        } else {
-            Err(io::Error::other(line))
+        match line.strip_prefix(prefix).and_then(|s| s.strip_prefix(' ')) {
+            Some(n) => self.parse_field(n, &line).await,
+            None => Err(self.refusal(line).await),
+        }
+    }
+
+    /// Read a reserve's reply: a job, or the reason there isn't one.
+    async fn read_reserved(&mut self) -> Result<Reserved> {
+        let line = self.read_line().await?;
+        match line.as_str() {
+            "TIMED_OUT" => Ok(Reserved::TimedOut),
+            "DEADLINE_SOON" => Ok(Reserved::DeadlineSoon),
+            _ => Ok(Reserved::Job(self.read_job_body("RESERVED", &line).await?)),
         }
     }
 
     /// Read a response with a job body (RESERVED/FOUND): `<PREFIX> <id> <bytes>\r\n<data>\r\n`
-    async fn read_job_response(&mut self, prefix: &str) -> io::Result<Job> {
+    async fn read_job_response(&mut self, prefix: &str) -> Result<Job> {
         let line = self.read_line().await?;
-        if !line.starts_with(prefix) {
-            return Err(io::Error::other(line));
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected response: {line}")));
-        }
-        let id: u64 = parts[1].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let bytes: usize = parts[2].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut body = vec![0u8; bytes];
-        self.reader.read_exact(&mut body).await?;
-        // Consume trailing \r\n
-        let mut trail = [0u8; 2];
-        self.reader.read_exact(&mut trail).await?;
+        self.read_job_body(prefix, &line).await
+    }
+
+    /// Read the body that `line`, a `<PREFIX> <id> <bytes>` header, announces.
+    /// Any other line is the command's refusal.
+    async fn read_job_body(&mut self, prefix: &str, line: &str) -> Result<Job> {
+        let Some(header) = line.strip_prefix(prefix).and_then(|s| s.strip_prefix(' ')) else {
+            return Err(self.refusal(line.to_string()).await);
+        };
+        let Some((id, bytes)) = header.split_once(' ') else {
+            return Err(self.protocol(format!("unexpected reply {line:?}")).await);
+        };
+        let id: u64 = self.parse_field(id, line).await?;
+        let bytes: usize = self.parse_field(bytes, line).await?;
+        let body = self.read_body(bytes).await?;
         Ok(Job { id, body })
     }
 
-    async fn read_ok_body(&mut self) -> io::Result<String> {
+    async fn read_ok_body(&mut self) -> Result<String> {
         let line = self.read_line().await?;
-        if !line.starts_with("OK ") {
-            return Err(io::Error::other(line));
+        let Some(bytes) = line.strip_prefix("OK ") else {
+            return Err(self.refusal(line).await);
+        };
+        let bytes: usize = self.parse_field(bytes, &line).await?;
+        let body = self.read_body(bytes).await?;
+        match String::from_utf8(body) {
+            Ok(body) => Ok(body),
+            Err(_) => Err(self.protocol("a YAML reply that isn't UTF-8".to_string()).await),
         }
-        let bytes: usize = line[3..]
-            .trim()
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut buf = vec![0u8; bytes + 2];
-        self.reader.read_exact(&mut buf).await?;
-        buf.truncate(bytes);
-        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    async fn send_line(&mut self, line: &str) -> io::Result<()> {
-        self.writer
-            .write_all(format!("{line}\r\n").as_bytes())
-            .await?;
-        self.writer.flush().await
+    /// Read a `bytes`-long body and the CRLF that must follow it.
+    async fn read_body(&mut self, bytes: usize) -> Result<Vec<u8>> {
+        let mut body = vec![0u8; bytes + 2];
+        match within(self.deadline, self.reader.read_exact(&mut body)).await {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(self.close(Error::Io(e)).await),
+            None => return Err(self.close(Error::Timeout).await),
+        }
+        if !body.ends_with(b"\r\n") {
+            return Err(self.protocol(format!("no CRLF after a {bytes}-byte body")).await);
+        }
+        body.truncate(bytes);
+        Ok(body)
     }
 
-    async fn read_line(&mut self) -> io::Result<String> {
-        let mut line = String::new();
-        self.reader.read_line(&mut line).await?;
-        if line.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed",
-            ));
+    /// Parse a number out of a reply. One that doesn't parse is a reply this
+    /// client can't follow, so it closes the connection.
+    async fn parse_field<T: std::str::FromStr>(&mut self, field: &str, line: &str) -> Result<T> {
+        match field.parse() {
+            Ok(n) => Ok(n),
+            Err(_) => Err(self.protocol(format!("unexpected reply {line:?}")).await),
         }
-        Ok(line.trim_end().to_string())
+    }
+
+    /// The error for a reply that isn't the one expected: tuber's refusal, if
+    /// it is one. Any other reply may carry a body this client won't read, so
+    /// it is a protocol error, and closes the connection.
+    async fn refusal(&mut self, line: String) -> Error {
+        match Error::from_reply(&line) {
+            Some(e) => e,
+            None => self.protocol(format!("unexpected reply {line:?}")).await,
+        }
+    }
+
+    async fn protocol(&mut self, msg: String) -> Error {
+        self.close(Error::Protocol(msg)).await
+    }
+
+    /// Give up on the connection after `err`: shut it, so tuber hands back
+    /// any job it held, and refuse every later call.
+    async fn close(&mut self, err: Error) -> Error {
+        self.closed = true;
+        let _ = self.writer.shutdown().await;
+        err
+    }
+
+    /// Send one command, already framed, and start the clock on its reply.
+    async fn send(&mut self, frame: &[u8]) -> Result<()> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        self.deadline = self.timeout.map(|t| tokio::time::Instant::now() + t);
+        let sent = async {
+            self.writer.write_all(frame).await?;
+            self.writer.flush().await
+        };
+        match within(self.deadline, sent).await {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(self.close(Error::Io(e)).await),
+            None => Err(self.close(Error::Timeout).await),
+        }
+    }
+
+    /// Allow `secs` more for the reply to a command that asked the server to
+    /// wait that long.
+    fn wait_longer(&mut self, secs: u32) {
+        self.deadline = self.deadline.map(|d| d + Duration::from_secs(secs.into()));
+    }
+
+    async fn send_line(&mut self, line: &str) -> Result<()> {
+        self.send(format!("{line}\r\n").as_bytes()).await
+    }
+
+    /// Read one reply line, without its line ending.
+    async fn read_line(&mut self) -> Result<String> {
+        let mut line = Vec::new();
+        match within(self.deadline, self.reader.read_until(b'\n', &mut line)).await {
+            Some(Ok(_)) if line.ends_with(b"\n") => {}
+            Some(Ok(_)) => {
+                let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed");
+                return Err(self.close(Error::Io(eof)).await);
+            }
+            Some(Err(e)) => return Err(self.close(Error::Io(e)).await),
+            None => return Err(self.close(Error::Timeout).await),
+        }
+        line.pop();
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+        match String::from_utf8(line) {
+            Ok(line) => Ok(line),
+            Err(_) => Err(self.protocol("a reply line that isn't UTF-8".to_string()).await),
+        }
+    }
+}
+
+/// Run `f` to completion, or until `deadline`: `None` when it missed it.
+async fn within<F: Future>(deadline: Option<tokio::time::Instant>, f: F) -> Option<F::Output> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, f).await.ok(),
+        None => Some(f.await),
     }
 }
 
@@ -598,12 +881,25 @@ mod tests {
         let r = parse_inserted("INSERTED 7 BURIED 1024").unwrap();
         assert_eq!(r.id, 7);
         assert_eq!(r.existing_state.as_deref(), Some("BURIED"));
+        assert_eq!(r.raised_pri, Some(1024));
+        assert_eq!(parse_inserted("INSERTED 7 READY").unwrap().raised_pri, None);
+    }
+
+    /// `delete-batch` with no ids is a malformed command, not a no-op.
+    #[tokio::test]
+    async fn an_empty_delete_batch_sends_nothing() {
+        let (addr, server) = converse(&[]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let err = c.delete_batch(&[]).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        drop(c);
+        assert!(server.await.unwrap().is_empty());
     }
 
     #[test]
     fn rejects_non_inserted_replies() {
-        for line in ["DRAINING", "BAD_FORMAT", "EXPECTED_CRLF", "JOB_TOO_BIG"] {
-            assert!(parse_inserted(line).is_err(), "{line} should be an error");
+        for line in ["DRAINING", "BAD_FORMAT", "EXPECTED_CRLF", "JOB_TOO_BIG", "INSERTED", "BURIED"] {
+            assert!(parse_inserted(line).is_none(), "{line} should be an error");
         }
     }
 
@@ -664,10 +960,11 @@ mod tests {
         }
     }
 
-    fn sync_error(err: &io::Error) -> &ScheduleSyncError {
-        err.get_ref()
-            .and_then(|e| e.downcast_ref::<ScheduleSyncError>())
-            .unwrap_or_else(|| panic!("not a ScheduleSyncError: {err}"))
+    fn sync_error(err: &Error) -> &ScheduleSyncError {
+        match err {
+            Error::ScheduleSync(e) => e,
+            other => panic!("not a ScheduleSyncError: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -761,16 +1058,16 @@ mod tests {
         let mut client = TuberClient::connect(&addr).await.unwrap();
         let bad = [entry("rollup", "5 * * * *\r\nflush-tube splat.maintenance")];
         let err = client.sync_schedules("splat", &bad, false).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
         let err = client.sync_schedules("splat", &[], false).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
         drop(client);
         assert!(server.await.unwrap().is_empty());
     }
 
-    fn assert_refused<T: std::fmt::Debug>(what: &str, result: io::Result<T>) {
+    fn assert_refused<T: std::fmt::Debug>(what: &str, result: Result<T>) {
         let err = result.expect_err(what);
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{what}: {err}");
+        assert!(matches!(err, Error::InvalidInput(_)), "{what}: {err:?}");
     }
 
     /// A name with a CRLF in it ends the command early and sends the rest as
@@ -853,6 +1150,194 @@ mod tests {
             server.await.unwrap(),
             ["stats", "list-tubes", "stats-tube default", "stats-tube gone"]
         );
+    }
+
+    /// TIMED_OUT and DEADLINE_SOON are answers, not failures: no job came in
+    /// time, or one this connection holds is about to run out of TTR.
+    #[tokio::test]
+    async fn a_reserve_that_gets_no_job_is_not_an_error() {
+        let (addr, _server) = converse(&[b"TIMED_OUT", b"DEADLINE_SOON"]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        assert_eq!(c.reserve_with_timeout(1).await.unwrap(), Reserved::TimedOut);
+        assert_eq!(c.reserve_with_timeout(1).await.unwrap(), Reserved::DeadlineSoon);
+    }
+
+    /// A batch worker waiting on `reserve-batch` is told DEADLINE_SOON when a
+    /// job it holds is about to run out of TTR. That is its cue to touch-all,
+    /// on the same connection: closing it would hand back every job it holds.
+    #[tokio::test]
+    async fn a_batch_reserve_told_deadline_soon_keeps_the_connection() {
+        let (addr, _server) = converse(&[b"DEADLINE_SOON", b"TOUCHED_ALL 3"]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let err = c.reserve_batch(10, Some(5)).await.unwrap_err();
+        assert_eq!(err.reply(), Some("DEADLINE_SOON"), "{err:?}");
+        assert!(!err.is_fatal(), "{err:?}");
+        assert_eq!(c.touch_all().await.unwrap(), 3);
+    }
+
+    /// beanstalkd answers a put it couldn't queue for want of memory
+    /// `BURIED <id>`: the job exists, buried, and the id is the caller's only
+    /// handle on it.
+    #[tokio::test]
+    async fn a_put_buried_on_arrival_keeps_its_id() {
+        let (addr, _server) = converse(&[b"BURIED 7"]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let put = c.put_tagged(0, 0, 60, b"x", &[]).await.unwrap();
+        assert_eq!(put.id, 7);
+        assert!(put.buried && !put.is_duplicate(), "{put:?}");
+    }
+
+    /// A reply the client can't frame leaves it not knowing where the next
+    /// one starts, so the connection is done with: the next command fails
+    /// without being sent, rather than reading leftovers as its reply.
+    #[tokio::test]
+    async fn a_framing_error_closes_the_connection() {
+        for bad in [
+            &b"RESERVED 1 x"[..],              // no length
+            b"RESERVED 1 3\r\nabcXY",            // no CRLF after the body
+            b"OK 5\r\nhello",                    // a body where a job was expected
+        ] {
+            let replies: &'static [&'static [u8]] = Box::leak(vec![bad, &b"OK 4\r\n---\n"[..]].into_boxed_slice());
+            let (addr, server) = converse(replies).await;
+            let mut c = TuberClient::connect(&addr).await.unwrap();
+            let what = String::from_utf8_lossy(bad);
+            let err = c.reserve_with_timeout(0).await.unwrap_err();
+            assert!(matches!(err, Error::Protocol(_)), "{what}: {err:?}");
+            let err = c.stats().await.unwrap_err();
+            assert!(matches!(err, Error::Closed), "{what}: the next command ran: {err:?}");
+            drop(c);
+            assert_eq!(server.await.unwrap(), ["reserve-with-timeout 0"], "{what}");
+        }
+    }
+
+    /// A server that accepts the connection and then says nothing: up, but
+    /// wedged, or not tuber.
+    async fn silent_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    /// A server that stops answering must not hang its client forever: a
+    /// `tuber-cli stats` from cron would never exit.
+    #[tokio::test]
+    async fn a_silent_server_times_out() {
+        let mut c = TuberClient::connect(&silent_server().await).await.unwrap();
+        // From here the clock jumps to the next timer whenever nothing else
+        // can run, so a timeout of any length takes no real time.
+        tokio::time::pause();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(3600), c.stats()).await;
+        let err = reply.expect("still waiting after an hour").unwrap_err();
+        assert!(matches!(err, Error::Timeout), "{err:?}");
+        // A reply may yet arrive; reading it as the next command's would be
+        // wrong, so the connection is done with.
+        assert!(matches!(c.stats().await.unwrap_err(), Error::Closed));
+    }
+
+    /// A server that answers its first command `reply`, but only after
+    /// `delay`.
+    async fn slow_server(delay: std::time::Duration, reply: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(r).read_line(&mut line).await.unwrap();
+            tokio::time::sleep(delay).await;
+            w.write_all(reply).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    /// The timeout is for the server's own work: a reserve that asks it to
+    /// wait gets that long on top. Real time, not a paused clock: one jumps
+    /// ahead before the server has read the command.
+    #[tokio::test]
+    async fn a_reserve_may_wait_as_long_as_it_asked_to() {
+        let second = std::time::Duration::from_secs(1);
+        let addr = slow_server(second, b"TIMED_OUT\r\n").await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        c.set_timeout(Some(std::time::Duration::from_millis(200)));
+        assert_eq!(c.reserve_with_timeout(1).await.unwrap(), Reserved::TimedOut);
+
+        let addr = slow_server(second, b"RESERVED_BATCH 0\r\n").await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        c.set_timeout(Some(std::time::Duration::from_millis(200)));
+        assert_eq!(c.reserve_batch(10, Some(1)).await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn a_blocking_reserve_waits_for_a_job() {
+        let addr = slow_server(std::time::Duration::from_secs(1), b"RESERVED 9 2\r\nhi\r\n").await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        c.set_timeout(Some(std::time::Duration::from_millis(200)));
+        let job = c.reserve().await.unwrap().job().unwrap();
+        assert_eq!((job.id, job.body.as_slice()), (9, &b"hi"[..]));
+    }
+
+    /// The worker's commands: finish a job by releasing it, steer reserves by
+    /// weight and mode, and look at what this connection holds and watches.
+    #[tokio::test]
+    async fn the_worker_commands_frame_and_parse() {
+        let (addr, server) = converse(&[
+            b"RELEASED",
+            b"NOT_FOUND",
+            b"USING weighted",
+            b"WATCHING 2",
+            b"FOUND 5 2\r\nhi",
+            b"OK 23\r\n---\n- default\n- emails\n",
+            b"USING emails",
+        ])
+        .await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        c.release(5, 1024, 30).await.unwrap();
+        assert!(matches!(c.release(6, 0, 0).await.unwrap_err(), Error::NotFound));
+        c.reserve_mode(ReserveMode::Weighted).await.unwrap();
+        assert_eq!(c.watch_weighted("emails", 5).await.unwrap(), 2);
+        assert_eq!(c.peek_reserved().await.unwrap(), Job { id: 5, body: b"hi".to_vec() });
+        assert_eq!(c.list_tubes_watched().await.unwrap(), ["default", "emails"]);
+        assert_eq!(c.list_tube_used().await.unwrap(), "emails");
+        drop(c);
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                "release 5 1024 30",
+                "release 6 0 0",
+                "reserve-mode weighted",
+                "watch emails 5",
+                "peek-reserved",
+                "list-tubes-watched",
+                "list-tube-used",
+            ]
+        );
+    }
+
+    /// beanstalkd answers a release it couldn't queue for want of memory
+    /// `BURIED`: the job is buried rather than ready, and the connection fine.
+    #[tokio::test]
+    async fn a_release_buried_for_want_of_memory_is_out_of_memory() {
+        let (addr, _server) = converse(&[b"BURIED", b"TOUCHED_ALL 0"]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        assert!(matches!(c.release(5, 0, 0).await.unwrap_err(), Error::OutOfMemory));
+        assert_eq!(c.touch_all().await.unwrap(), 0);
+    }
+
+    /// A weight outside 1..=9999 is refused before it is sent, as tuber would.
+    #[tokio::test]
+    async fn a_watch_weight_out_of_range_sends_nothing() {
+        let (addr, server) = converse(&[]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        for weight in [0, 10_000] {
+            assert_refused(&format!("weight {weight}"), c.watch_weighted("emails", weight).await);
+        }
+        drop(c);
+        assert!(server.await.unwrap().is_empty());
     }
 
     #[tokio::test]
