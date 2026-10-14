@@ -275,7 +275,7 @@ paused tube at zero is exactly the one you need to see.
 
 ```
 +------------------------------------------------------------------------+
-| tuber-tui v0.17.0 - hetz01:11300                                       |
+| tuber-tui v0.18.0 - hetz01:11300                                       |
 | tuber 0.13.0 - gr | up 41m | conns: 105 (producers:68 workers:35 ...)   |
 | Mem: 77.7% (875.4MB / 1.1GB) | TOAST: 75% live | Disk: 57.1% (1.1/2.0G)|
 +------------------------------------------------------------------------+
