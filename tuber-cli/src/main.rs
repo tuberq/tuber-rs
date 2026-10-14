@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
-use tuber_lib::client::TuberClient;
+use tuber_lib::client::{Job, TuberClient};
 
 mod schedule_file;
 
@@ -43,8 +43,9 @@ enum Command {
 
     /// Put a job into a tube
     Put {
-        /// Job body (reads from stdin if not provided)
-        body: Option<String>,
+        /// Job body (reads from stdin if not provided). Bytes, as given: it
+        /// need not be text.
+        body: Option<std::ffi::OsString>,
 
         /// Tube to use (default: "default")
         #[arg(long, default_value = "default")]
@@ -284,10 +285,11 @@ async fn main() -> anyhow::Result<()> {
         } => {
             client.use_tube(&tube).await?;
             let data = match body {
-                Some(b) => b,
+                // On Unix these are the argument's own bytes.
+                Some(b) => b.into_encoded_bytes(),
                 None => {
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf)?;
                     buf
                 }
             };
@@ -307,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(c) = concurrency {
                 tags.push(format!("con:{c}"));
             }
-            let res = client.put_tagged(priority, delay, ttr, data.as_bytes(), &tags).await?;
+            let res = client.put_tagged(priority, delay, ttr, &data, &tags).await?;
             // A dedup against a buried job is still not a failure, but nothing
             // was queued and nothing runs until that job is kicked. Run from
             // cron, a put like that drops its work every time, and only stderr
@@ -333,8 +335,8 @@ async fn main() -> anyhow::Result<()> {
             if let Some(tube) = tube {
                 client.watch_only(&tube).await?;
             }
-            let (id, body) = client.reserve(timeout).await?;
-            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+            let job = client.reserve(timeout).await?;
+            output(&cli.format, &job_json(&job))?;
         }
 
         Command::ReserveBatch { count, timeout, tube } => {
@@ -342,10 +344,7 @@ async fn main() -> anyhow::Result<()> {
                 client.watch_only(&tube).await?;
             }
             let jobs = client.reserve_batch(count, timeout).await?;
-            let jobs: Vec<_> = jobs
-                .into_iter()
-                .map(|(id, body)| serde_json::json!({ "id": id, "body": body }))
-                .collect();
+            let jobs: Vec<_> = jobs.iter().map(job_json).collect();
             output(&cli.format, &serde_json::json!({ "reserved": jobs.len(), "jobs": jobs }))?;
         }
 
@@ -366,8 +365,8 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::ReserveJob { id } => {
-            let (id, body) = client.reserve_job(id).await?;
-            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+            let job = client.reserve_job(id).await?;
+            output(&cli.format, &job_json(&job))?;
         }
 
         Command::Drain => {
@@ -381,26 +380,26 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Peek { id } => {
-            let (id, body) = client.peek(id).await?;
-            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+            let job = client.peek(id).await?;
+            output(&cli.format, &job_json(&job))?;
         }
 
         Command::PeekReady { tube } => {
             client.use_tube(&tube).await?;
-            let (id, body) = client.peek_ready().await?;
-            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+            let job = client.peek_ready().await?;
+            output(&cli.format, &job_json(&job))?;
         }
 
         Command::PeekBuried { tube } => {
             client.use_tube(&tube).await?;
-            let (id, body) = client.peek_buried().await?;
-            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+            let job = client.peek_buried().await?;
+            output(&cli.format, &job_json(&job))?;
         }
 
         Command::PeekDelayed { tube } => {
             client.use_tube(&tube).await?;
-            let (id, body) = client.peek_delayed().await?;
-            output(&cli.format, &serde_json::json!({ "id": id, "body": body }))?;
+            let job = client.peek_delayed().await?;
+            output(&cli.format, &job_json(&job))?;
         }
 
         Command::StatsJob { id } => {
@@ -483,6 +482,32 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A job as JSON: its body as a string when it is UTF-8, and otherwise as
+/// `body_base64`, since a JSON string can't hold arbitrary bytes.
+fn job_json(job: &Job) -> serde_json::Value {
+    match job.body_str() {
+        Some(body) => serde_json::json!({ "id": job.id, "body": body }),
+        None => serde_json::json!({ "id": job.id, "body_base64": base64(&job.body) }),
+    }
+}
+
+/// Standard base64, padded (RFC 4648 §4).
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 fn output(format: &OutputFormat, value: &impl serde::Serialize) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
     let written = match format {
@@ -542,5 +567,26 @@ fn format_value(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => "null".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64;
+
+    #[test]
+    fn base64_matches_rfc_4648() {
+        for (raw, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(raw.as_bytes()), encoded, "{raw:?}");
+        }
+        assert_eq!(base64(b"\xff\x00a"), "/wBh");
     }
 }

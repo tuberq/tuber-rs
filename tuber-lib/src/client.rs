@@ -42,6 +42,21 @@ fn parse_inserted(line: &str) -> io::Result<PutResult> {
     })
 }
 
+/// A reserved or peeked job. The body is bytes, exactly as put: tuber doesn't
+/// require text, so neither does this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub id: u64,
+    pub body: Vec<u8>,
+}
+
+impl Job {
+    /// The body as text, if it is UTF-8.
+    pub fn body_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.body).ok()
+    }
+}
+
 pub struct TuberClient {
     reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
     writer: tokio::net::tcp::OwnedWriteHalf,
@@ -156,7 +171,7 @@ impl TuberClient {
 
     /// Reserve the next available job, waiting up to `timeout` seconds.
     /// Sends: `reserve-with-timeout <seconds>\r\n` — expects: `RESERVED <id> <bytes>\r\n<data>\r\n`
-    pub async fn reserve(&mut self, timeout: u32) -> io::Result<(u64, String)> {
+    pub async fn reserve(&mut self, timeout: u32) -> io::Result<Job> {
         self.send_line(&format!("reserve-with-timeout {timeout}")).await?;
         self.read_job_response("RESERVED").await
     }
@@ -164,7 +179,7 @@ impl TuberClient {
     /// Reserve one specific job by ID, regardless of tube or watch list. The
     /// job must be ready, delayed, or buried — not already reserved.
     /// Sends: `reserve-job <id>\r\n` — expects: `RESERVED <id> <bytes>\r\n<data>\r\n`
-    pub async fn reserve_job(&mut self, id: u64) -> io::Result<(u64, String)> {
+    pub async fn reserve_job(&mut self, id: u64) -> io::Result<Job> {
         self.send_line(&format!("reserve-job {id}")).await?;
         self.read_job_response("RESERVED").await
     }
@@ -175,7 +190,7 @@ impl TuberClient {
     /// the watch list, so use [`watch_only`](Self::watch_only) to target a tube.
     /// Sends: `reserve-batch <count> [timeout]\r\n`
     /// Expects: `RESERVED_BATCH <n>\r\n` then n × `RESERVED <id> <bytes>\r\n<data>\r\n`
-    pub async fn reserve_batch(&mut self, count: u32, timeout: Option<u32>) -> io::Result<Vec<(u64, String)>> {
+    pub async fn reserve_batch(&mut self, count: u32, timeout: Option<u32>) -> io::Result<Vec<Job>> {
         let cmd = match timeout {
             Some(t) => format!("reserve-batch {count} {t}"),
             None => format!("reserve-batch {count}"),
@@ -262,25 +277,25 @@ impl TuberClient {
 
     /// Peek at a job by ID without reserving it.
     /// Sends: `peek <id>\r\n` — expects: `FOUND <id> <bytes>\r\n<data>\r\n`
-    pub async fn peek(&mut self, id: u64) -> io::Result<(u64, String)> {
+    pub async fn peek(&mut self, id: u64) -> io::Result<Job> {
         self.send_line(&format!("peek {id}")).await?;
         self.read_job_response("FOUND").await
     }
 
     /// Peek at the next ready job in the currently used tube.
-    pub async fn peek_ready(&mut self) -> io::Result<(u64, String)> {
+    pub async fn peek_ready(&mut self) -> io::Result<Job> {
         self.send_line("peek-ready").await?;
         self.read_job_response("FOUND").await
     }
 
     /// Peek at the next buried job in the currently used tube.
-    pub async fn peek_buried(&mut self) -> io::Result<(u64, String)> {
+    pub async fn peek_buried(&mut self) -> io::Result<Job> {
         self.send_line("peek-buried").await?;
         self.read_job_response("FOUND").await
     }
 
     /// Peek at the next delayed job in the currently used tube.
-    pub async fn peek_delayed(&mut self) -> io::Result<(u64, String)> {
+    pub async fn peek_delayed(&mut self) -> io::Result<Job> {
         self.send_line("peek-delayed").await?;
         self.read_job_response("FOUND").await
     }
@@ -493,7 +508,7 @@ impl TuberClient {
     }
 
     /// Read a response with a job body (RESERVED/FOUND): `<PREFIX> <id> <bytes>\r\n<data>\r\n`
-    async fn read_job_response(&mut self, prefix: &str) -> io::Result<(u64, String)> {
+    async fn read_job_response(&mut self, prefix: &str) -> io::Result<Job> {
         let line = self.read_line().await?;
         if !line.starts_with(prefix) {
             return Err(io::Error::other(line));
@@ -504,13 +519,12 @@ impl TuberClient {
         }
         let id: u64 = parts[1].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let bytes: usize = parts[2].parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut buf = vec![0u8; bytes];
-        self.reader.read_exact(&mut buf).await?;
+        let mut body = vec![0u8; bytes];
+        self.reader.read_exact(&mut body).await?;
         // Consume trailing \r\n
         let mut trail = [0u8; 2];
         self.reader.read_exact(&mut trail).await?;
-        let body = String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok((id, body))
+        Ok(Job { id, body })
     }
 
     async fn read_ok_body(&mut self) -> io::Result<String> {
@@ -587,7 +601,7 @@ mod tests {
     /// `replies[n]`, and hangs up on a command past the last. Its handle
     /// yields every line it was sent, with a `schedule-put`'s body as the line
     /// after it, so it resolves once the client hangs up too.
-    async fn converse(replies: &'static [&'static str]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    async fn converse(replies: &'static [&'static [u8]]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
@@ -615,7 +629,10 @@ mod tests {
                 // Out of replies, hang up rather than leave the client waiting
                 // on one, but go on reading so the handle reports what it sent.
                 match replies.next() {
-                    Some(reply) => w.write_all(format!("{reply}\r\n").as_bytes()).await.unwrap(),
+                    Some(reply) => {
+                        w.write_all(reply).await.unwrap();
+                        w.write_all(b"\r\n").await.unwrap();
+                    }
                     None => w.shutdown().await.unwrap(),
                 }
             }
@@ -645,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sync_is_begin_puts_commit() {
-        let (addr, server) = converse(&["SYNCING splat", "STAGED", "STAGED", "SYNCED 1 1 2 0"]).await;
+        let (addr, server) = converse(&[b"SYNCING splat", b"STAGED", b"STAGED", b"SYNCED 1 1 2 0"]).await;
         let mut client = TuberClient::connect(&addr).await.unwrap();
         let set = [entry("rollup", "5 * * * *"), entry("retention", "0 2 * * * Australia/Melbourne")];
         let result = client.sync_schedules("splat", &set, false).await.unwrap();
@@ -668,7 +685,7 @@ mod tests {
     /// sync is aborted on the spot, and the error names the entry.
     #[tokio::test]
     async fn a_refused_entry_aborts_the_sync_and_is_named() {
-        let (addr, server) = converse(&["SYNCING splat", "STAGED", "BAD_SCHEDULE", "ABORTED"]).await;
+        let (addr, server) = converse(&[b"SYNCING splat", b"STAGED", b"BAD_SCHEDULE", b"ABORTED"]).await;
         let mut client = TuberClient::connect(&addr).await.unwrap();
         let set = [
             entry("rollup", "5 * * * *"),
@@ -692,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_is_reported_even_if_the_abort_fails() {
         // No reply scripted for schedule-abort: the server hangs up instead.
-        let (addr, _server) = converse(&["SYNCING splat", "BAD_SCHEDULE"]).await;
+        let (addr, _server) = converse(&[b"SYNCING splat", b"BAD_SCHEDULE"]).await;
         let mut client = TuberClient::connect(&addr).await.unwrap();
         let err = client
             .sync_schedules("splat", &[entry("retention", "0 2 * * * Australia/Melborne")], false)
@@ -704,7 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_commit_internal_error_is_live() {
-        let (addr, _server) = converse(&["SYNCING splat", "STAGED", "INTERNAL_ERROR"]).await;
+        let (addr, _server) = converse(&[b"SYNCING splat", b"STAGED", b"INTERNAL_ERROR"]).await;
         let mut client = TuberClient::connect(&addr).await.unwrap();
         let err = client
             .sync_schedules("splat", &[entry("rollup", "5 * * * *")], false)
@@ -717,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_old_server_says_it_has_no_schedules() {
-        let (addr, _server) = converse(&["UNKNOWN_COMMAND"]).await;
+        let (addr, _server) = converse(&[b"UNKNOWN_COMMAND"]).await;
         let mut client = TuberClient::connect(&addr).await.unwrap();
         let err = client
             .sync_schedules("splat", &[entry("rollup", "5 * * * *")], false)
@@ -784,9 +801,27 @@ mod tests {
         assert!(server.await.unwrap().is_empty());
     }
 
+    /// A job body is bytes, not text. Refusing one that isn't UTF-8 lost its
+    /// id with the job still reserved, and left the batch's later jobs on the
+    /// wire for the next command to read as its reply.
+    #[tokio::test]
+    async fn a_body_that_is_not_utf8_is_returned_as_bytes() {
+        let (addr, _server) = converse(&[
+            b"RESERVED_BATCH 3\r\nRESERVED 1 1\r\n\xff\r\nRESERVED 2 3\r\nok1\r\nRESERVED 3 3\r\nok2",
+            b"OK 4\r\n---\n",
+        ])
+        .await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let jobs = c.reserve_batch(3, None).await.unwrap();
+        let got: Vec<(u64, &[u8])> = jobs.iter().map(|j| (j.id, j.body.as_ref())).collect();
+        assert_eq!(got, [(1, &b"\xff"[..]), (2, b"ok1"), (3, b"ok2")]);
+        // The connection is still in step: stats reads its own reply.
+        c.stats().await.unwrap();
+    }
+
     #[tokio::test]
     async fn lists_schedules_as_owner_name_pairs() {
-        let (addr, server) = converse(&["OK 37\r\n---\n- splat rollup\n- splat retention\n"]).await;
+        let (addr, server) = converse(&[b"OK 37\r\n---\n- splat rollup\n- splat retention\n"]).await;
         let mut client = TuberClient::connect(&addr).await.unwrap();
         let list = client.list_schedules(Some("splat")).await.unwrap();
         assert_eq!(

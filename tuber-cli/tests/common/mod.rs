@@ -60,7 +60,9 @@ pub fn scripted_server(replies: &[&'static [u8]]) -> FakeServer {
                 let mut body = vec![0u8; n + 2];
                 reader.read_exact(&mut body).unwrap();
                 body.truncate(n);
-                let _ = tx.send(String::from_utf8(body).unwrap());
+                // A body that isn't UTF-8 is reported escaped, `\xff`.
+                let body = String::from_utf8(body).unwrap_or_else(|e| e.into_bytes().escape_ascii().to_string());
+                let _ = tx.send(body);
             }
             (&stream).write_all(reply).unwrap();
         }
