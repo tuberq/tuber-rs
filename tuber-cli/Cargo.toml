@@ -1,7 +1,11 @@
 [package]
 name = "tuber-cli"
+description = "Command-line client for tuber and beanstalkd work queues, with JSON output for scripts and agents"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 tuber-lib = { workspace = true, features = ["serde"] }

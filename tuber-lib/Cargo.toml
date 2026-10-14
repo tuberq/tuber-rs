@@ -1,7 +1,11 @@
 [package]
 name = "tuber-lib"
+description = "Async client for tuber, the beanstalkd-compatible work queue, with its extensions: idempotent puts, groups, concurrency limits and recurring schedules"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
