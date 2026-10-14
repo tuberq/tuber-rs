@@ -9,6 +9,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/tuberq/tuber-rs"
+readme = "README.md"
 
 [workspace.dependencies]
 # The version is what a packaged tuber-cli or tuber-tui asks for, so it moves
