@@ -10,13 +10,9 @@
 //! [`sync_schedules`]: crate::client::TuberClient::sync_schedules
 
 use crate::error::Result;
-use crate::name::{check_name, invalid};
+use crate::name::{check_name, invalid, is_tuber_tag};
 use crate::parse::{get_str, get_u64, parse_yaml_map};
 use std::fmt;
-
-/// The tags a `schedule-put` line may carry: the four a `put` takes, which
-/// every fire carries, and `catchup:`, which is the entry's own.
-const TAG_PREFIXES: [&str; 5] = ["idp:", "con:", "grp:", "aft:", "catchup:"];
 
 /// One entry of a sync: what each fire puts, and when.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,22 +54,27 @@ impl ScheduleEntry {
     }
 
     /// Refuse, before anything is sent, what tuber would refuse as
-    /// `BAD_FORMAT` or misread: names outside tube-name rules, tags without a
-    /// known prefix, and specs that would break the line.
+    /// `BAD_FORMAT` or misread: names outside tube-name rules, tags tuber
+    /// wouldn't parse, and specs that would break the line.
     fn validate(&self) -> Result<()> {
         check_name("schedule name", &self.name)?;
         check_name(&format!("tube of schedule {}", self.name), &self.tube)?;
+        // The tags a put takes, which every fire carries, and catchup:, which
+        // is the entry's own.
         for tag in &self.tags {
-            let known = TAG_PREFIXES
-                .iter()
-                .any(|p| tag.len() > p.len() && tag.starts_with(p));
-            if !known || tag.bytes().any(|b| b <= b' ' || b == 0x7f) {
+            if !is_tuber_tag(tag, true) {
                 return Err(invalid(format!(
-                    "schedule {}: tag {tag:?} is not one of idp:, con:, grp:, aft: or catchup: \
-                     with a value and no spaces",
+                    "schedule {}: tag {tag:?} is not one tuber takes: idp:<key>[:<ttl>], \
+                     con:<key>[:<limit>], grp:<group>, aft:<group> or catchup:<secs>, where a key \
+                     has no colon",
                     self.name
                 )));
             }
+        }
+        // A job in a group that waits for that group would wait for itself.
+        let group = self.tags.iter().find_map(|t| t.strip_prefix("grp:"));
+        if group.is_some() && group == self.tags.iter().find_map(|t| t.strip_prefix("aft:")) {
+            return Err(invalid(format!("schedule {}: a job can't wait on its own group", self.name)));
         }
         // A spec token with a colon would be read as a tag, and a control
         // character would end the line or corrupt it.
@@ -297,6 +298,15 @@ mod tests {
         );
     }
 
+    /// The numbers tuber takes after a key: an idp: TTL, a con: limit, and
+    /// catchup's seconds.
+    #[test]
+    fn accepts_the_tags_tuber_documents() {
+        let tags = ["idp:rollup:3600", "con:maintenance:2", "grp:nightly", "aft:import", "catchup:300"];
+        let e = ScheduleEntry { tags: tags.map(String::from).to_vec(), ..entry("a", "@daily") };
+        assert!(e.validate().is_ok(), "{:?}", e.validate());
+    }
+
     #[test]
     fn accepts_the_spec_forms_tuber_documents() {
         for spec in [
@@ -323,6 +333,13 @@ mod tests {
             ("bare tag", ScheduleEntry { tags: vec!["idp:".into()], ..entry("a", "@daily") }),
             ("space in tag", ScheduleEntry { tags: vec!["con:a b".into()], ..entry("a", "@daily") }),
             ("bad tube", ScheduleEntry { tube: "".into(), ..entry("a", "@daily") }),
+            // tuber reads the last colon as the start of a number, and refuses
+            // what isn't one, or a key outside tube-name rules.
+            ("idp TTL not a number", ScheduleEntry { tags: vec!["idp:nightly:report".into()], ..entry("a", "@daily") }),
+            ("con limit 0", ScheduleEntry { tags: vec!["con:k:0".into()], ..entry("a", "@daily") }),
+            ("colon in a group", ScheduleEntry { tags: vec!["grp:a:b".into()], ..entry("a", "@daily") }),
+            ("catchup not a number", ScheduleEntry { tags: vec!["catchup:soon".into()], ..entry("a", "@daily") }),
+            ("waits on its own group", ScheduleEntry { tags: vec!["grp:g".into(), "aft:g".into()], ..entry("a", "@daily") }),
         ];
         for (what, e) in cases {
             let err = e.validate().expect_err(what);

@@ -129,3 +129,14 @@ fn stats_schedule_parses_values_with_colons() {
     assert_eq!(v["last_fire"], "");
     assert_eq!(v["buried_streak"], 3);
 }
+
+/// tuber reads the last colon in an idp: value as the start of a TTL, so
+/// "nightly:report" is BAD_FORMAT there. It is refused before anything is sent.
+#[test]
+fn a_tag_tuber_would_refuse_is_refused_before_sending() {
+    let server = scripted_server(&[b"SYNCING ops\r\n", b"BAD_FORMAT\r\n", b"ABORTED\r\n"]);
+    let file = r#"[{"name": "report", "tube": "reports", "cron": "0 2 * * *", "idp": "nightly:report", "body": "x"}]"#;
+    let out = run(&server, &["schedule-sync", "ops", "-"], file);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(server.transcript().is_empty(), "sent {:?}", server.transcript());
+}

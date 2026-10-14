@@ -11,15 +11,38 @@ pub(crate) const MAX_NAME_LEN: usize = 200;
 /// up to 200 bytes of letters, digits and `- + / ; . $ _ ( )`, not starting
 /// with `-`.
 pub(crate) fn check_name(what: &str, name: &str) -> Result<()> {
-    let valid_byte = |b: u8| b.is_ascii_alphanumeric() || b"-+/;.$_()".contains(&b);
-    if name.is_empty()
-        || name.len() > MAX_NAME_LEN
-        || name.starts_with('-')
-        || !name.bytes().all(valid_byte)
-    {
+    if !is_valid_name(name) {
         return Err(invalid(format!("invalid {what} {name:?}")));
     }
     Ok(())
+}
+
+fn is_valid_name(name: &str) -> bool {
+    let valid_byte = |b: u8| b.is_ascii_alphanumeric() || b"-+/;.$_()".contains(&b);
+    !name.is_empty() && name.len() <= MAX_NAME_LEN && !name.starts_with('-') && name.bytes().all(valid_byte)
+}
+
+/// True for a tag as tuber parses one: `idp:<key>[:<ttl>]`,
+/// `con:<key>[:<limit>]` with a limit of at least 1, `grp:<group>`,
+/// `aft:<group>`, and, where `catchup` allows, `catchup:<secs>`. The last
+/// colon in an `idp:` or `con:` value starts its number, so a key can't hold
+/// one.
+pub(crate) fn is_tuber_tag(tag: &str, catchup: bool) -> bool {
+    let key_and_number = |value: &str, min: u32| match value.rsplit_once(':') {
+        Some((key, n)) => is_valid_name(key) && n.parse::<u32>().is_ok_and(|n| n >= min),
+        None => is_valid_name(value),
+    };
+    if let Some(value) = tag.strip_prefix("idp:") {
+        key_and_number(value, 0)
+    } else if let Some(value) = tag.strip_prefix("con:") {
+        key_and_number(value, 1)
+    } else if let Some(group) = tag.strip_prefix("grp:").or_else(|| tag.strip_prefix("aft:")) {
+        is_valid_name(group)
+    } else if let Some(secs) = tag.strip_prefix("catchup:") {
+        catchup && secs.parse::<u32>().is_ok()
+    } else {
+        false
+    }
 }
 
 /// Check a `put` tag. Tags are passed through as given, so tuber is the judge
