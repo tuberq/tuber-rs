@@ -6,7 +6,7 @@ This workspace contains three crates:
 
 - **tuber-cli** — command-line client with JSON output, designed for scripting and AI agents
 - **tuber-tui** — real-time terminal dashboard for monitoring queues
-- **tuber-lib** — shared protocol client library (internal)
+- **tuber-lib** — async client library: the protocol, tuber's extensions, and typed errors
 
 ## tuber-cli
 
@@ -42,11 +42,15 @@ tuber-cli put --tube emails "send user@example.com"
 # Put from stdin
 echo '{"user": "alice"}' | tuber-cli put --tube notifications
 
+# A body is bytes, so a file needn't be text
+tuber-cli put --tube thumbs < photo.jpg
+
 # Tuber extensions: idempotent put, job groups, fan-in, concurrency limits
 tuber-cli put --tube emails --idempotent welcome-42 "send welcome"
 tuber-cli put --tube work --group batch-1 "shard 1"
 tuber-cli put --tube work --after batch-1 "cleanup"
 tuber-cli put --tube work --concurrency user-42 "resize avatar"
+tuber-cli put --tube work --concurrency user-42:3 "resize avatar"   # up to 3 at once
 
 # Reserve a job
 tuber-cli reserve --timeout 5
@@ -79,13 +83,40 @@ tuber-cli stats --format text
 Note that a reservation belongs to the connection that made it, and each
 `tuber-cli` run is a new connection. The reservation is released the moment
 the process exits, which is why there is no `tuber-cli bury`, `release` or
-`touch` — nothing can follow `reserve` to finish the job. Use `tuber-lib` (or
-one `nc` session) to reserve and finish a job together; see `skill/SKILL.md`.
+`touch` — nothing can follow `reserve` to finish the job. Use
+[tuber-lib](#tuber-lib) (or one `nc` session) to reserve and finish a job
+together; see `skill/SKILL.md`.
+
+A job body that is UTF-8 comes out as `"body"`; one that isn't comes out
+base64-encoded as `"body_base64"`, since a JSON string can't hold arbitrary
+bytes.
+
+Idempotency keys, group names and concurrency keys take letters, digits and
+`- + / ; . $ _ ( )`. A colon is refused rather than sent, because tuber would
+read `idp:series:123` as key `series` with a 123-second TTL: give a TTL with
+`--idempotent-ttl`, and a concurrency limit as `--concurrency key:N`.
 
 A put whose `--idempotent` key matches a buried job still exits 0 (the key did
 its job), but warns on stderr: nothing was queued, and nothing runs until that
 job is kicked, so a put from cron that keeps hitting it would otherwise drop
 its work without a word.
+
+### Errors and exit codes
+
+A failure prints one JSON object on stderr — `{"error": "NOT_FOUND",
+"message": "NOT_FOUND"}` — or, with `--format text`, a line such as
+`Error: NOT_FOUND`. `error` is tuber's own reply where there is one. The exit
+code says which kind of failure it was:
+
+| Exit | `error` | Meaning |
+|---|---|---|
+| 0 | | Success |
+| 1 | `ERROR` | Anything else, such as a schedule file that won't parse |
+| 2 | `INVALID_INPUT` | Bad arguments, refused before anything was sent |
+| 3 | `NOT_FOUND` | No such job, tube or schedule entry; also `delete-batch` when any id wasn't found |
+| 4 | `TIMED_OUT`, `DEADLINE_SOON` | A reserve that got no job |
+| 5 | `DRAINING`, `OUT_OF_MEMORY`, `BAD_SCHEDULE`, … | Tuber refused the command |
+| 6 | `UNREACHABLE`, `NO_REPLY`, `PROTOCOL_ERROR` | No server, or it stopped answering (30s) or made no sense |
 
 ### Recurring schedules
 
@@ -124,7 +155,7 @@ misspelled `zone` can't silently run an entry in UTC.
 The set **replaces** the owner's entries: any the file leaves out are deleted.
 An empty file is refused unless you pass `--allow-empty`, which is how you
 remove them all. If tuber refuses one entry (an unknown zone, a cron that never
-matches), the sync is aborted, nothing changes, and the run exits 1 naming the
+matches), the sync is aborted, nothing changes, and the run exits 5 naming the
 entry. Sync at deploy or boot; don't re-sync an app's owner by hand, or its
 next boot will undo it.
 
@@ -193,7 +224,7 @@ tuber-tui -i 0.5                 # faster polling (0.5s)
 | Option | Default | Description |
 |---|---|---|
 | `[HOST]` positional | `$TUBER_URL`, `$TUBER_ADDR`, `$BEANSTALKD_URL`, or `localhost:11300` | Server address (same lookup as tuber-cli) |
-| `-i, --interval` | `1.5` | Poll interval (seconds) |
+| `-i, --interval` | `1.5` | Poll interval in seconds, more than 0 and at most 86400 |
 
 ### Keys
 
@@ -308,14 +339,55 @@ than the machine. Set `--hostname` on the container, or give the server a `name`
 if you want that line to say something recognisable.
 
 On a narrow terminal the bar gives way first, then the timing suffix, then the
-name truncates.On a narrow terminal the bar gives way first, then the timing suffix, then the
 name truncates. The counts and the total are the only numbers on a row that
 appear nowhere else on screen, so they are never traded away.
+
+## tuber-lib
+
+The async client the other two are built on, for a worker that reserves and
+finishes jobs on one connection. It isn't on crates.io yet:
+
+```toml
+tuber-lib = { git = "https://github.com/tuberq/tuber-rs" }
+```
+
+```rust
+use tuber_lib::{tag, Reserved, TuberClient};
+
+let mut client = TuberClient::connect("localhost:11300").await?;
+
+// Produce
+client.use_tube("emails").await?;
+let tags = [tag::idp("welcome-42")?, tag::concurrency_limit("user-42", 3)?];
+let put = client.put_tagged(1024, 0, 120, b"send welcome", &tags).await?;
+
+// Consume
+client.watch_only("emails").await?;
+loop {
+    match client.reserve_with_timeout(5).await? {
+        Reserved::Job(job) => match handle(&job.body).await {
+            Ok(()) => client.delete(job.id).await?,
+            Err(_) => client.release(job.id, 1024, 30).await?,
+        },
+        Reserved::TimedOut => continue,
+        // A job this connection holds is about to run out of TTR.
+        Reserved::DeadlineSoon => _ = client.touch_all().await?,
+    }
+}
+```
+
+Errors are `tuber_lib::Error`. Tuber's refusals (`NotFound`, `Draining`,
+`InternalError`, …) leave the connection usable. An I/O error, a timeout (30
+seconds per reply by default; see `set_timeout`) or a reply the client can't
+read closes it, handing back any job it held; `is_fatal()` says which, and
+every later call fails with `Closed` until you connect again. A put answered
+`InternalError` wasn't queued but may come back after a tuber restart, so retry
+it with an `idp:` key.
 
 ## Requirements
 
 - A running [tuber](https://github.com/tuberq/tuber) server (or any beanstalkd-compatible server)
-- Rust 1.75+ (for building from source)
+- Rust 1.88+ (for building from source)
 
 ## License
 
