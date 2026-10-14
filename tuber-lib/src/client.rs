@@ -97,7 +97,17 @@ impl TuberClient {
         let tube_names = self.list_tubes().await?;
         let mut tubes = Vec::with_capacity(tube_names.len());
         for name in &tube_names {
-            tubes.push(self.stats_tube(name).await?);
+            // Only a laxer server could list a name this client won't send,
+            // and there is no asking about it.
+            if check_name("tube name", name).is_err() {
+                continue;
+            }
+            match self.stats_tube(name).await {
+                Ok(tube) => tubes.push(tube),
+                // Emptied, and so gone, since list-tubes named it.
+                Err(e) if e.to_string() == "NOT_FOUND" => {}
+                Err(e) => return Err(e),
+            }
         }
         // Busiest first, so a caller that takes the head of the list gets the
         // tubes worth looking at. Callers that want another order re-sort.
@@ -817,6 +827,32 @@ mod tests {
         assert_eq!(got, [(1, &b"\xff"[..]), (2, b"ok1"), (3, b"ok2")]);
         // The connection is still in step: stats reads its own reply.
         c.stats().await.unwrap();
+    }
+
+    /// Tubes come and go between `list-tubes` and the `stats-tube` that
+    /// follows: one emptied in that gap answers NOT_FOUND. The snapshot leaves
+    /// it out rather than failing whole, which the TUI showed as a lost
+    /// connection.
+    #[tokio::test]
+    async fn a_tube_that_vanishes_mid_snapshot_is_left_out() {
+        let (addr, server) = converse(&[
+            b"OK 4\r\n---\n",
+            b"OK 33\r\n---\n- default\n- gone\n- two words\n",
+            b"OK 18\r\n---\nname: default\n",
+            b"NOT_FOUND",
+        ])
+        .await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let snap = c.fetch_snapshot().await.unwrap();
+        let names: Vec<&str> = snap.tubes.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["default"]);
+        drop(c);
+        // A name a laxer server lists but this client won't send is skipped
+        // too, without asking.
+        assert_eq!(
+            server.await.unwrap(),
+            ["stats", "list-tubes", "stats-tube default", "stats-tube gone"]
+        );
     }
 
     #[tokio::test]
