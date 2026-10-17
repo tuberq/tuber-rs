@@ -338,8 +338,13 @@ impl TuberClient {
         let Some(n) = line.strip_prefix("RESERVED_BATCH ") else {
             return Err(self.refusal(line).await);
         };
-        let n: usize = self.parse_field(n, &line).await?;
-        let mut jobs = Vec::with_capacity(n);
+        let n: u64 = self.parse_field(n, &line).await?;
+        // tuber never sends more than were asked for. A count past that can't
+        // be trusted, as a capacity least of all.
+        if n > u64::from(count) {
+            return Err(self.protocol(format!("{line:?}: asked for {count}")).await);
+        }
+        let mut jobs = Vec::new();
         for _ in 0..n {
             // Every job is read, whatever its body: one left on the wire
             // would be read as the next command's reply.
@@ -1153,6 +1158,30 @@ mod tests {
         assert_eq!(got, [(1, &b"\xff"[..]), (2, b"ok1"), (3, b"ok2")]);
         // The connection is still in step: stats reads its own reply.
         c.stats().await.unwrap();
+    }
+
+    /// tuber never returns more jobs than were asked for. A count past that is
+    /// a reply this client can't trust, and was taken as a capacity: 99999999999
+    /// asked for terabytes and aborted, u64::MAX panicked.
+    #[tokio::test]
+    async fn a_batch_count_past_the_one_asked_for_is_a_protocol_error() {
+        for bad in [
+            &b"RESERVED_BATCH 99999999999"[..],
+            b"RESERVED_BATCH 18446744073709551615",
+            b"RESERVED_BATCH 11",
+        ] {
+            let replies: &'static [&'static [u8]] =
+                Box::leak(vec![bad, &b"OK 4\r\n---\n"[..]].into_boxed_slice());
+            let (addr, server) = converse(replies).await;
+            let mut c = TuberClient::connect(&addr).await.unwrap();
+            let what = String::from_utf8_lossy(bad);
+            let err = c.reserve_batch(10, None).await.unwrap_err();
+            assert!(matches!(err, Error::Protocol(_)), "{what}: {err:?}");
+            let err = c.stats().await.unwrap_err();
+            assert!(matches!(err, Error::Closed), "{what}: the next command ran: {err:?}");
+            drop(c);
+            assert_eq!(server.await.unwrap(), ["reserve-batch 10"], "{what}");
+        }
     }
 
     /// Tubes come and go between `list-tubes` and the `stats-tube` that
