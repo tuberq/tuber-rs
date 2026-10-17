@@ -604,6 +604,14 @@ mod tests {
         assert_eq!(flush_target(FlushScope::All, &tube), 43);
     }
 
+    /// tuber's flush-tube sweeps held jobs too, so `all` has to count them.
+    #[test]
+    fn flush_all_counts_held_jobs() {
+        let tube = TubeStats::from_yaml("name: q\ncurrent-jobs-ready: 2\ncurrent-jobs-held: 7\n");
+        assert_eq!(flush_target(FlushScope::All, &tube), 9);
+        assert_eq!(flush_plan(FlushScope::All, &tube), "delete 9 jobs");
+    }
+
     #[test]
     fn flush_plan_names_the_pile_it_deletes() {
         let tube = test_support::tube("q", 1908, 12, 0, 23);

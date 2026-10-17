@@ -78,11 +78,12 @@ const PAUSE_RESERVE: usize = 12;
 /// has to sit between ready's green and reserved's yellow without reading as
 /// either. Darker than a plain orange so it survives a light background — full
 /// #FFA500 on white is about a 2:1 contrast, which the header line loses.
-const STATES: [(&str, &str, Color); 5] = [
+const STATES: [(&str, &str, Color); 6] = [
     ("ready", "ready", Color::Green),
     ("urgnt", "urgent", Color::Rgb(217, 119, 6)),
     ("resvd", "reserved", Color::Yellow),
     ("delay", "delayed", Color::Blue),
+    ("held", "held", Color::Magenta),
     ("buried", "buried", Color::Red),
 ];
 
@@ -92,23 +93,32 @@ const STATES: [(&str, &str, Color); 5] = [
 /// `current-jobs-ready`, so the two columns would otherwise double-count it and
 /// stop summing to the total. Written once and fed by both callers below, so a
 /// tube's columns and the server's cannot come to disagree about that.
-fn state_counts(ready: u64, urgent: u64, reserved: u64, delayed: u64, buried: u64) -> [u64; 5] {
+fn state_counts(
+    ready: u64,
+    urgent: u64,
+    reserved: u64,
+    delayed: u64,
+    held: u64,
+    buried: u64,
+) -> [u64; 6] {
     [
         ready.saturating_sub(urgent),
         urgent,
         reserved,
         delayed,
+        held,
         buried,
     ]
 }
 
 /// A tube's counts.
-fn tube_counts(tube: &TubeStats) -> [u64; 5] {
+fn tube_counts(tube: &TubeStats) -> [u64; 6] {
     state_counts(
         tube.current_jobs_ready,
         tube.current_jobs_urgent,
         tube.current_jobs_reserved,
         tube.current_jobs_delayed,
+        tube.current_jobs_held,
         tube.current_jobs_buried,
     )
 }
@@ -119,12 +129,13 @@ fn tube_counts(tube: &TubeStats) -> [u64; 5] {
 /// the chart hides empty tubes and scrolls, so a column sum would change as you
 /// navigate, which is useless for the number you are watching. `current-jobs-urgent`
 /// is on the wire in the global stats — it was simply never parsed.
-fn server_counts(server: &ServerStats) -> [u64; 5] {
+fn server_counts(server: &ServerStats) -> [u64; 6] {
     state_counts(
         server.current_jobs_ready,
         server.current_jobs_urgent,
         server.current_jobs_reserved,
         server.current_jobs_delayed,
+        server.current_jobs_held,
         server.current_jobs_buried,
     )
 }
@@ -814,8 +825,8 @@ fn row_widths(
 /// screen but moved *between polls*: a tube's last delayed job finishing removed
 /// the `delay` column and shifted everything after it sideways, so on a live
 /// dashboard the numbers you were reading jumped under you. Stability over time
-/// is worth more than the seven columns, and all five still fit an 80-column
-/// terminal with the bar at its floor.
+/// is worth more than the seven columns, and all six still fit an 80-column
+/// terminal with the bar at its floor, names up to 15 characters.
 fn active_columns() -> Vec<usize> {
     (0..STATES.len()).collect()
 }
@@ -872,7 +883,7 @@ fn count_field_width(n: usize) -> usize {
 /// has to keep its place, but a screenful of zeros reads as data. Shared by the
 /// tube rows and the totals footer so the two cannot drift out of alignment —
 /// which is the whole point of the columns.
-fn count_spans(counts: &[u64; 5], columns: &[usize], emphasis: Modifier) -> Vec<Span<'static>> {
+fn count_spans(counts: &[u64; 6], columns: &[usize], emphasis: Modifier) -> Vec<Span<'static>> {
     columns
         .iter()
         .enumerate()
@@ -943,8 +954,8 @@ fn column_block_width(columns: &[usize]) -> usize {
 /// segments within it, which made a tube holding one job look as busy as one
 /// holding a million, and a handful of buried jobs look like a third of the
 /// queue.
-fn bar_cells(counts: &[u64; 5], total: u64, max_total: u64, width: usize) -> ([usize; 5], usize) {
-    let mut cells = [0usize; 5];
+fn bar_cells(counts: &[u64; 6], total: u64, max_total: u64, width: usize) -> ([usize; 6], usize) {
+    let mut cells = [0usize; STATES.len()];
     if total == 0 || max_total == 0 || width == 0 {
         return (cells, 0);
     }
@@ -980,7 +991,7 @@ fn bar_cells(counts: &[u64; 5], total: u64, max_total: u64, width: usize) -> ([u
 /// The size bar: coloured fill for the jobs a tube holds, dim track for the rest
 /// of the scale.
 fn size_bar_spans(
-    counts: &[u64; 5],
+    counts: &[u64; 6],
     total: u64,
     max_total: u64,
     width: usize,
@@ -2452,13 +2463,13 @@ mod tests {
         }
         assert!(seen_placeholder, "a tube with no samples should show a placeholder");
 
-        // The bar gives way before the ewma does, so at 70 the column is still
+        // The bar gives way before the ewma does, so at 77 the column is still
         // there with no bar beside it.
-        let seventy = &draw_chart(&app, 70, 15)[HEADER_LINE];
-        assert!(seventy.contains("ewma"), "ewma dropped before the bar: {seventy:?}");
-        assert!(!seventy.contains("size"), "bar kept at 70 columns: {seventy:?}");
+        let narrow = &draw_chart(&app, 77, 15)[HEADER_LINE];
+        assert!(narrow.contains("ewma"), "ewma dropped before the bar: {narrow:?}");
+        assert!(!narrow.contains("size"), "bar kept at 77 columns: {narrow:?}");
         // Narrower still and the column goes too, label and all.
-        assert!(!draw_chart(&app, 65, 15)[HEADER_LINE].contains("ewma"));
+        assert!(!draw_chart(&app, 72, 15)[HEADER_LINE].contains("ewma"));
     }
 
     /// Every state keeps its column whether anything is using it or not.
@@ -2488,6 +2499,43 @@ mod tests {
         for state in STATES.iter().map(|(header, _, _)| *header) {
             assert!(header.contains(state), "header dropped {state}: {header:?}");
         }
+    }
+
+    /// Held jobs (tuber 0.17.0's aft: jobs waiting on their group) get their
+    /// own column beside delayed, in the rows and in the server's totals, and
+    /// a line in the detail pane.
+    #[test]
+    fn held_jobs_have_a_column_beside_delayed() {
+        let mut app = App::new("test:11300".to_string());
+        app.update(Snapshot {
+            server: ServerStats::from_yaml(
+                "version: tuber 0.17.0\ncurrent-jobs-delayed: 3\ncurrent-jobs-held: 4321\n",
+            ),
+            tubes: vec![TubeStats::from_yaml(
+                "name: q\ncurrent-jobs-delayed: 3\ncurrent-jobs-held: 17\n",
+            )],
+            fetched_at: Instant::now(),
+        });
+        let lines = draw_chart(&app, 130, 13);
+        let header = &lines[HEADER_LINE];
+        let (delay, held) = (header.find("delay").unwrap(), header.find("held"));
+        assert!(held.is_some_and(|h| h > delay), "no held column after delay: {header:?}");
+
+        let row = lines
+            .iter()
+            .find(|l| l.trim_start_matches([' ', '\u{258c}']).starts_with('q'))
+            .expect("no tube row");
+        assert!(row.contains("20"), "the total leaves out held: {row:?}");
+        assert!(row.contains("17"), "the row lacks the held count: {row:?}");
+        let footer = lines.iter().find(|l| l.contains("server")).expect("no totals row");
+        assert!(footer.contains("4.3K"), "totals row lacks the held count: {footer:?}");
+
+        let app = app_with_selection(
+            vec![TubeStats::from_yaml("name: q\ncurrent-jobs-held: 17\n")],
+            "q",
+        );
+        let jobs = detail_line(&draw_frame(&app, 130, 24), "jobs").unwrap();
+        assert!(jobs.contains("17 held"), "jobs reads {jobs:?}");
     }
 
     /// The column set does not depend on the data, so it cannot shift as the
@@ -2558,10 +2606,10 @@ mod tests {
             }
         }
 
-        // With all five states in play the counts alone need 72 columns, so an
-        // 80-column terminal keeps a six-cell bar and anything narrower spends
-        // the width on the numbers instead.
-        for width in [60u16, 70] {
+        // With all six states and these names the counts need 70 columns and
+        // the bar's floor 8 more, so an 80-column terminal keeps a six-cell bar
+        // and anything narrower spends the width on the numbers instead.
+        for width in [67u16, 77] {
             let header = &draw_chart(&app, width, 10)[HEADER_LINE];
             assert!(!header.contains("size"), "width {width} kept the bar: {header:?}");
             assert!(header.contains("total"), "width {width} lost the total");
@@ -2594,7 +2642,7 @@ mod tests {
         for width in 1..=BAR_MAX {
             for &total in &[1u64, 5, 908, 10_145, 192_000, 1_900_000] {
                 for &max_total in &[908u64, 10_145, 1_900_000] {
-                    let counts = [total / 2, total / 8, total / 8, total / 8, total / 8];
+                    let counts = [total / 2, total / 8, total / 8, total / 8, total / 8, total / 8];
                     let sum: u64 = counts.iter().sum();
                     if sum == 0 {
                         continue;
@@ -2615,7 +2663,7 @@ mod tests {
     fn bar_length_tracks_total() {
         let max = 1_900_000;
         let len = |total: u64| {
-            let counts = [total, 0, 0, 0, 0];
+            let counts = [total, 0, 0, 0, 0, 0];
             bar_cells(&counts, total, max, 12).1
         };
         // The busiest tube fills the bar; a quiet one gets a stub; nothing at
@@ -2650,16 +2698,16 @@ mod tests {
         // the tube, so it must not claim a cell of a 12-wide bar — the red count
         // column is what makes it visible. Rounding it up to one cell would say
         // 8%, which is the distortion the old bar had.
-        let counts = [10_000, 0, 0, 0, 145];
+        let counts = [10_000, 0, 0, 0, 0, 145];
         let (cells, filled) = bar_cells(&counts, 10_145, 10_145, 12);
         assert_eq!(filled, 12);
-        assert_eq!(cells[4], 0, "1.4% must not round up to a cell");
+        assert_eq!(cells[5], 0, "1.4% must not round up to a cell");
         assert_eq!(cells[0], 12);
 
         // A state with a real share does get cells.
-        let work = [5, 0, 0, 10, 893];
+        let work = [5, 0, 0, 10, 0, 893];
         let (cells, _) = bar_cells(&work, 908, 1_900_000, 12);
-        assert!(cells[4] > 0, "98% buried must dominate the fill: {cells:?}");
+        assert!(cells[5] > 0, "98% buried must dominate the fill: {cells:?}");
     }
 
     #[test]

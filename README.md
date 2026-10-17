@@ -179,7 +179,7 @@ A real-time terminal dashboard for monitoring tuber queues.
 ### Features
 
 - Live server stats: version, uptime, connections, memory and disk headroom, drain status, and a red `WAL FAILED` when persistence has stopped and puts are being refused
-- Per-tube job counts in fixed, colour-coded columns — ready, urgent, reserved, delayed, buried — beside a log-scaled bar sizing each tube against the busiest
+- Per-tube job counts in fixed, colour-coded columns — ready, urgent, reserved, delayed, held, buried — beside a log-scaled bar sizing each tube against the busiest
 - Throughput rates: puts/s, reserves/s, deletes/s, timeouts/s
 - A detail pane for whichever tube the cursor is on: bimodal processing EWMA, percentiles, oldest job ages, bury rate, `idp:` dedups (a dedup against a buried job in red), watcher counts
 - Server totals as a footer row on the table, selectable like a tube to turn the pane over to the server

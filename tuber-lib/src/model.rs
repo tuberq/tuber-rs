@@ -17,6 +17,12 @@ pub struct ServerStats {
     pub current_jobs_ready: u64,
     pub current_jobs_reserved: u64,
     pub current_jobs_delayed: u64,
+    /// aft: jobs waiting for their group to complete (tuber 0.17.0). Stored as
+    /// delayed with no deadline but counted apart from `current_jobs_delayed`,
+    /// and out of reach of `peek-delayed` and `kick`. 0 from older servers and
+    /// beanstalkd, which do not send it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub current_jobs_held: u64,
     pub current_jobs_buried: u64,
     pub cmd_put: u64,
     pub cmd_reserve: u64,
@@ -89,6 +95,7 @@ impl ServerStats {
             current_jobs_ready: get_u64(&m, "current-jobs-ready"),
             current_jobs_reserved: get_u64(&m, "current-jobs-reserved"),
             current_jobs_delayed: get_u64(&m, "current-jobs-delayed"),
+            current_jobs_held: get_u64(&m, "current-jobs-held"),
             current_jobs_buried: get_u64(&m, "current-jobs-buried"),
             cmd_put: get_u64(&m, "cmd-put"),
             cmd_reserve: get_u64(&m, "cmd-reserve"),
@@ -143,6 +150,12 @@ pub struct TubeStats {
     pub current_jobs_ready: u64,
     pub current_jobs_reserved: u64,
     pub current_jobs_delayed: u64,
+    /// aft: jobs waiting for their group to complete (tuber 0.17.0). Stored as
+    /// delayed with no deadline but counted apart from `current_jobs_delayed`,
+    /// and out of reach of `peek-delayed` and `kick`. 0 from older servers and
+    /// beanstalkd, which do not send it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub current_jobs_held: u64,
     pub current_jobs_buried: u64,
     pub total_jobs: u64,
     pub current_using: u64,
@@ -190,7 +203,11 @@ pub struct TubeStats {
 
 impl TubeStats {
     pub fn current_total(&self) -> u64 {
-        self.current_jobs_ready + self.current_jobs_reserved + self.current_jobs_delayed + self.current_jobs_buried
+        self.current_jobs_ready
+            + self.current_jobs_reserved
+            + self.current_jobs_delayed
+            + self.current_jobs_held
+            + self.current_jobs_buried
     }
 
     /// True when the tube is paused and the pause has not yet elapsed.
@@ -206,6 +223,7 @@ impl TubeStats {
             current_jobs_ready: get_u64(&m, "current-jobs-ready"),
             current_jobs_reserved: get_u64(&m, "current-jobs-reserved"),
             current_jobs_delayed: get_u64(&m, "current-jobs-delayed"),
+            current_jobs_held: get_u64(&m, "current-jobs-held"),
             current_jobs_buried: get_u64(&m, "current-jobs-buried"),
             total_jobs: get_u64(&m, "total-jobs"),
             current_using: get_u64(&m, "current-using"),
@@ -419,6 +437,33 @@ queue-time-samples: 28089
         assert_eq!(t.total_idp_dedups_delayed, 2);
         assert_eq!(t.total_idp_dedups_buried, 70);
         assert_eq!(t.total_idp_dedups_deleted, 1);
+    }
+
+    /// tuber 0.17.0's held count: aft: jobs waiting on their group. They are
+    /// in no other count, so the total has to add them or a tube full of them
+    /// reads as empty.
+    #[test]
+    fn parses_held_jobs_into_the_tube_total() {
+        let yaml = "---\nname: \"q\"\ncurrent-jobs-ready: 2\ncurrent-jobs-delayed: 3\n\
+                    current-jobs-held: 7\ncurrent-jobs-buried: 1\n";
+        let t = TubeStats::from_yaml(yaml);
+        assert_eq!(t.current_jobs_held, 7);
+        assert_eq!(t.current_jobs_delayed, 3, "held is not part of delayed");
+        assert_eq!(t.current_total(), 13);
+    }
+
+    #[test]
+    fn parses_server_held_jobs() {
+        let s = ServerStats::from_yaml("---\ncurrent-jobs-delayed: 3\ncurrent-jobs-held: 7\n");
+        assert_eq!(s.current_jobs_held, 7);
+        assert_eq!(s.current_jobs_delayed, 3);
+    }
+
+    /// Older tuber servers and beanstalkd do not send the field.
+    #[test]
+    fn held_defaults_to_zero_when_absent() {
+        assert_eq!(TubeStats::from_yaml(PAUSED_TUBE).current_jobs_held, 0);
+        assert_eq!(ServerStats::from_yaml("---\nversion: 1.13\n").current_jobs_held, 0);
     }
 
     #[test]
