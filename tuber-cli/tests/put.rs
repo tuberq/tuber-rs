@@ -84,5 +84,15 @@ fn a_concurrency_key_may_carry_its_limit() {
         &[b"USING default\r\n", b"INSERTED 1\r\n"],
     );
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(sent[1], "put 0 0 120 1 idp:k:60 con:user-42:3");
+    assert_eq!(sent[1], "put 65536 0 120 1 idp:k:60 con:user-42:3");
+}
+
+/// With no --priority a put takes 65536, as tuber-gem, beaneater, `tuber put`
+/// and a schedule file's entries do, so a job put by hand queues alongside
+/// theirs rather than ahead of them.
+#[test]
+fn a_put_without_a_priority_takes_65536() {
+    let (out, sent) = put_with(&["x"], &[b"USING default\r\n", b"INSERTED 1\r\n"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(sent[1], "put 65536 0 120 1");
 }

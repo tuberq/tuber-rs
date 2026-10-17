@@ -71,7 +71,7 @@ fn put_from_stdin(body: &[u8]) -> (Output, Vec<String>) {
 fn a_binary_body_on_stdin_is_put_as_is() {
     let (out, sent) = put_from_stdin(b"\xff\x00a");
     json(&out);
-    assert_eq!(sent, ["use default", "put 0 0 120 3", r"\xff\x00a"]);
+    assert_eq!(sent, ["use default", "put 65536 0 120 3", r"\xff\x00a"]);
 }
 
 #[cfg(unix)]
@@ -87,5 +87,5 @@ fn a_binary_body_argument_is_put_as_is() {
         .output()
         .unwrap();
     json(&out);
-    assert_eq!(server.transcript(), ["use default", "put 0 0 120 2", r"\xffa"]);
+    assert_eq!(server.transcript(), ["use default", "put 65536 0 120 2", r"\xffa"]);
 }

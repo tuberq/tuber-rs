@@ -145,7 +145,7 @@ covers when and how. `schedule-sync` reads the set as a JSON array:
 | `cron` + optional `zone` | 5-field cron or `@daily`-style macro, in an IANA zone (default UTC) |
 | `every` + optional `offset` | Seconds, or `"10m"`/`"1h"`/`"1d"`, aligned to the Unix epoch |
 | `spec` | The spec as tuber reads it, instead of the two above |
-| `pri`, `delay`, `ttr` | As for `put`; default 65536, 0, 120, as tuber-gem has them (not `put`'s priority 0, which is urgent) |
+| `pri`, `delay`, `ttr` | As for `put`; default 65536, 0, 120, as tuber-gem and `put` have them |
 | `idp`, `con`, `grp`, `aft` | The tag's value, as on the wire: `"rollup"`, `"maintenance:2"` |
 | `catchup` | After downtime: `"once"` (default), `"never"` (or `false`), or a number of seconds |
 

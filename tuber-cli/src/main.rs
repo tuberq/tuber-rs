@@ -53,8 +53,8 @@ enum Command {
         #[arg(long, default_value = "default")]
         tube: String,
 
-        /// Job priority (0 is highest)
-        #[arg(long, default_value = "0")]
+        /// Job priority (0 is highest; the default is tuber-gem's)
+        #[arg(long, default_value = "65536")]
         priority: u32,
 
         /// Delay in seconds before job becomes ready
