@@ -19,12 +19,12 @@ use serde::Deserialize;
 use tuber_lib::schedule::ScheduleEntry;
 
 /// Defaults for what a put line carries, as tuber-gem defaults them, so an
-/// entry means the same schedule whichever syncs it. The priority is not
-/// `tuber-cli put`'s 0: under 1024 is urgent, and a recurring job left at
-/// the default should not jump ahead of everything else.
-const DEFAULT_PRI: u32 = 65536;
-const DEFAULT_DELAY: u32 = 0;
-const DEFAULT_TTR: u32 = 120;
+/// entry means the same schedule whichever syncs it. `tuber-cli put` uses
+/// them too. Under 1024 is urgent, and a job left at the default should not
+/// jump ahead of everything else.
+pub(crate) const DEFAULT_PRI: u32 = 65536;
+pub(crate) const DEFAULT_DELAY: u32 = 0;
+pub(crate) const DEFAULT_TTR: u32 = 120;
 
 /// One entry as written in the file. Unknown fields are refused: a
 /// misspelled `"zone"` would otherwise run the entry in UTC without a word.

@@ -3,16 +3,11 @@
 
 mod common;
 
-use common::scripted_server;
+use common::{scripted_server, tuber_cli};
 use std::process::{Command, Output};
 
 fn run(replies: &[&'static [u8]], args: &[&str]) -> Output {
-    let server = scripted_server(replies);
-    Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr])
-        .args(args)
-        .output()
-        .unwrap()
+    tuber_cli(&scripted_server(replies), args, b"")
 }
 
 fn json(out: &Output) -> serde_json::Value {
@@ -50,18 +45,8 @@ fn a_batch_with_a_binary_body_keeps_every_job() {
 
 /// Run `put` with `body` on stdin, and return what the server was sent.
 fn put_from_stdin(body: &[u8]) -> (Output, Vec<String>) {
-    use std::io::Write;
-    use std::process::Stdio;
     let server = scripted_server(&[b"USING default\r\n", b"INSERTED 1\r\n"]);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr, "put"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(body).unwrap();
-    let out = child.wait_with_output().unwrap();
+    let out = tuber_cli(&server, &["put"], body);
     (out, server.transcript())
 }
 

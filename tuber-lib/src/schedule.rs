@@ -9,8 +9,8 @@
 //!
 //! [`sync_schedules`]: crate::client::TuberClient::sync_schedules
 
-use crate::error::Result;
-use crate::name::{check_name, invalid, is_tuber_tag};
+use crate::error::{Error, Result};
+use crate::name::{check_name, is_tuber_tag};
 use crate::parse::{get_str, get_u64, parse_yaml_map};
 use std::fmt;
 
@@ -62,8 +62,8 @@ impl ScheduleEntry {
         // The tags a put takes, which every fire carries, and catchup:, which
         // is the entry's own.
         for tag in &self.tags {
-            if !is_tuber_tag(tag, true) {
-                return Err(invalid(format!(
+            if !is_tuber_tag(tag) {
+                return Err(Error::InvalidInput(format!(
                     "schedule {}: tag {tag:?} is not one tuber takes: idp:<key>[:<ttl>], \
                      con:<key>[:<limit>], grp:<group>, aft:<group> or catchup:<secs>, where a key \
                      has no colon",
@@ -74,13 +74,13 @@ impl ScheduleEntry {
         // A job in a group that waits for that group would wait for itself.
         let group = self.tags.iter().find_map(|t| t.strip_prefix("grp:"));
         if group.is_some() && group == self.tags.iter().find_map(|t| t.strip_prefix("aft:")) {
-            return Err(invalid(format!("schedule {}: a job can't wait on its own group", self.name)));
+            return Err(Error::InvalidInput(format!("schedule {}: a job can't wait on its own group", self.name)));
         }
         // A spec token with a colon would be read as a tag, and a control
         // character would end the line or corrupt it.
         let spec = self.spec.trim();
         if spec.is_empty() || spec.contains(':') || spec.chars().any(char::is_control) {
-            return Err(invalid(format!(
+            return Err(Error::InvalidInput(format!(
                 "schedule {}: invalid spec {:?}",
                 self.name, self.spec
             )));
@@ -94,7 +94,7 @@ impl ScheduleEntry {
 pub(crate) fn validate_sync(owner: &str, entries: &[ScheduleEntry], allow_empty: bool) -> Result<()> {
     check_name("schedule owner", owner)?;
     if entries.is_empty() && !allow_empty {
-        return Err(invalid(format!(
+        return Err(Error::InvalidInput(format!(
             "refusing to sync no entries for {owner}: that removes all of its schedules"
         )));
     }
@@ -102,7 +102,7 @@ pub(crate) fn validate_sync(owner: &str, entries: &[ScheduleEntry], allow_empty:
     for entry in entries {
         entry.validate()?;
         if !seen.insert(entry.name.as_str()) {
-            return Err(invalid(format!("schedule {} appears twice", entry.name)));
+            return Err(Error::InvalidInput(format!("schedule {} appears twice", entry.name)));
         }
     }
     Ok(())
@@ -145,7 +145,7 @@ impl SyncResult {
 }
 
 /// Why a sync didn't take. [`sync_schedules`] returns it as
-/// [`Error::ScheduleSync`](crate::Error::ScheduleSync).
+/// [`Error::ScheduleSync`].
 ///
 /// Nothing changed unless [`is_live`](Self::is_live) says otherwise.
 ///

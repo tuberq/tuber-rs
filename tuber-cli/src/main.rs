@@ -54,15 +54,15 @@ enum Command {
         tube: String,
 
         /// Job priority (0 is highest; the default is tuber-gem's)
-        #[arg(long, default_value = "65536")]
+        #[arg(long, default_value_t = schedule_file::DEFAULT_PRI)]
         priority: u32,
 
         /// Delay in seconds before job becomes ready
-        #[arg(long, default_value = "0")]
+        #[arg(long, default_value_t = schedule_file::DEFAULT_DELAY)]
         delay: u32,
 
         /// Time-to-run in seconds
-        #[arg(long, default_value = "120")]
+        #[arg(long, default_value_t = schedule_file::DEFAULT_TTR)]
         ttr: u32,
 
         /// Idempotency key: drop the put if a live job with this key exists in
@@ -282,10 +282,10 @@ enum Failure {
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Failure::NoJob(reply) => f.write_str(reply),
-            Failure::Usage(msg) => f.write_str(msg),
-        }
+        f.write_str(match self {
+            Failure::NoJob(reply) => reply,
+            Failure::Usage(msg) => msg,
+        })
     }
 }
 
@@ -317,29 +317,32 @@ fn report(format: &OutputFormat, err: &anyhow::Error) -> ExitCode {
 
 /// The `error` word a failure reports, and its exit code: tuber's own reply
 /// where there is one, so it reads as it does in tuber's docs.
-fn classify(err: &anyhow::Error) -> (String, u8) {
+fn classify(err: &anyhow::Error) -> (&str, u8) {
     use tuber_lib::Error as E;
     if let Some(failure) = err.downcast_ref::<Failure>() {
         return match failure {
-            Failure::NoJob(reply) => (reply.to_string(), exit::NO_JOB),
-            Failure::Usage(_) => ("INVALID_INPUT".into(), exit::USAGE),
+            Failure::NoJob(reply) => (reply, exit::NO_JOB),
+            Failure::Usage(_) => ("INVALID_INPUT", exit::USAGE),
         };
     }
     let Some(err) = err.downcast_ref::<E>() else {
-        return ("ERROR".into(), exit::OTHER);
+        return ("ERROR", exit::OTHER);
     };
+    if let Some(reply) = err.reply() {
+        let code = match err {
+            E::NotFound => exit::NOT_FOUND,
+            E::DeadlineSoon => exit::NO_JOB,
+            _ => exit::REFUSED,
+        };
+        return (reply, code);
+    }
     match err {
-        E::NotFound => ("NOT_FOUND".into(), exit::NOT_FOUND),
-        E::DeadlineSoon => ("DEADLINE_SOON".into(), exit::NO_JOB),
-        E::InvalidInput(_) => ("INVALID_INPUT".into(), exit::USAGE),
-        E::Io(_) => ("UNREACHABLE".into(), exit::UNREACHABLE),
-        E::Timeout => ("NO_REPLY".into(), exit::UNREACHABLE),
-        E::Protocol(_) | E::Closed => ("PROTOCOL_ERROR".into(), exit::UNREACHABLE),
-        E::ScheduleSync(e) => (e.status.clone(), exit::REFUSED),
-        other => match other.reply() {
-            Some(reply) => (reply.to_string(), exit::REFUSED),
-            None => ("ERROR".into(), exit::OTHER),
-        },
+        E::InvalidInput(_) => ("INVALID_INPUT", exit::USAGE),
+        E::Io(_) => ("UNREACHABLE", exit::UNREACHABLE),
+        E::Timeout => ("NO_REPLY", exit::UNREACHABLE),
+        E::Protocol(_) | E::Closed => ("PROTOCOL_ERROR", exit::UNREACHABLE),
+        E::ScheduleSync(e) => (&e.status, exit::REFUSED),
+        _ => ("ERROR", exit::OTHER),
     }
 }
 

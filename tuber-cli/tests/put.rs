@@ -2,16 +2,12 @@
 
 mod common;
 
-use common::scripted_server;
-use std::process::{Command, Output};
+use common::{scripted_server, tuber_cli};
+use std::process::Output;
 
 fn put(replies: &[&'static [u8]]) -> Output {
     let server = scripted_server(replies);
-    Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr])
-        .args(["put", "--tube", "splat.maintenance", "--idempotent", "rollup", "{}"])
-        .output()
-        .unwrap()
+    tuber_cli(&server, &["put", "--tube", "splat.maintenance", "--idempotent", "rollup", "{}"], b"")
 }
 
 /// A dedup against a buried job queues nothing, and nothing runs until that job
@@ -55,11 +51,7 @@ fn a_dedup_that_raised_the_priority_says_so() {
 
 fn put_with(args: &[&str], replies: &[&'static [u8]]) -> (Output, Vec<String>) {
     let server = scripted_server(replies);
-    let out = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr, "put"])
-        .args(args)
-        .output()
-        .unwrap();
+    let out = tuber_cli(&server, &[&["put"], args].concat(), b"");
     (out, server.transcript())
 }
 

@@ -12,7 +12,7 @@ pub(crate) const MAX_NAME_LEN: usize = 200;
 /// with `-`.
 pub(crate) fn check_name(what: &str, name: &str) -> Result<()> {
     if !is_valid_name(name) {
-        return Err(invalid(format!("invalid {what} {name:?}")));
+        return Err(Error::InvalidInput(format!("invalid {what} {name:?}")));
     }
     Ok(())
 }
@@ -24,10 +24,9 @@ fn is_valid_name(name: &str) -> bool {
 
 /// True for a tag as tuber parses one: `idp:<key>[:<ttl>]`,
 /// `con:<key>[:<limit>]` with a limit of at least 1, `grp:<group>`,
-/// `aft:<group>`, and, where `catchup` allows, `catchup:<secs>`. The last
-/// colon in an `idp:` or `con:` value starts its number, so a key can't hold
-/// one.
-pub(crate) fn is_tuber_tag(tag: &str, catchup: bool) -> bool {
+/// `aft:<group>`, and `catchup:<secs>`. The last colon in an `idp:` or `con:`
+/// value starts its number, so a key can't hold one.
+pub(crate) fn is_tuber_tag(tag: &str) -> bool {
     let key_and_number = |value: &str, min: u32| match value.rsplit_once(':') {
         Some((key, n)) => is_valid_name(key) && n.parse::<u32>().is_ok_and(|n| n >= min),
         None => is_valid_name(value),
@@ -39,7 +38,7 @@ pub(crate) fn is_tuber_tag(tag: &str, catchup: bool) -> bool {
     } else if let Some(group) = tag.strip_prefix("grp:").or_else(|| tag.strip_prefix("aft:")) {
         is_valid_name(group)
     } else if let Some(secs) = tag.strip_prefix("catchup:") {
-        catchup && secs.parse::<u32>().is_ok()
+        secs.parse::<u32>().is_ok()
     } else {
         false
     }
@@ -50,13 +49,9 @@ pub(crate) fn is_tuber_tag(tag: &str, catchup: bool) -> bool {
 /// tag, whitespace, or a control byte.
 pub(crate) fn check_tag(tag: &str) -> Result<()> {
     if tag.is_empty() || tag.bytes().any(|b| b <= b' ' || b == 0x7f) {
-        return Err(invalid(format!("invalid tag {tag:?}: a tag can't be empty or hold spaces")));
+        return Err(Error::InvalidInput(format!("invalid tag {tag:?}: a tag can't be empty or hold spaces")));
     }
     Ok(())
-}
-
-pub(crate) fn invalid(msg: String) -> Error {
-    Error::InvalidInput(msg)
 }
 
 /// Build the tuber tags a [`put_tagged`] carries, checked as tuber will read

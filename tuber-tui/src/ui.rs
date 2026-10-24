@@ -87,6 +87,9 @@ const STATES: [(&str, &str, Color); 6] = [
     ("buried", "buried", Color::Red),
 ];
 
+/// One count per state, in [`STATES`]' order.
+type Counts = [u64; STATES.len()];
+
 /// Counts indexed to match [`STATES`].
 ///
 /// Ready is net of urgent: `current-jobs-urgent` is a subset of
@@ -100,7 +103,7 @@ fn state_counts(
     delayed: u64,
     held: u64,
     buried: u64,
-) -> [u64; 6] {
+) -> Counts {
     [
         ready.saturating_sub(urgent),
         urgent,
@@ -112,7 +115,7 @@ fn state_counts(
 }
 
 /// A tube's counts.
-fn tube_counts(tube: &TubeStats) -> [u64; 6] {
+fn tube_counts(tube: &TubeStats) -> Counts {
     state_counts(
         tube.current_jobs_ready,
         tube.current_jobs_urgent,
@@ -129,7 +132,7 @@ fn tube_counts(tube: &TubeStats) -> [u64; 6] {
 /// the chart hides empty tubes and scrolls, so a column sum would change as you
 /// navigate, which is useless for the number you are watching. `current-jobs-urgent`
 /// is on the wire in the global stats — it was simply never parsed.
-fn server_counts(server: &ServerStats) -> [u64; 6] {
+fn server_counts(server: &ServerStats) -> Counts {
     state_counts(
         server.current_jobs_ready,
         server.current_jobs_urgent,
@@ -883,7 +886,7 @@ fn count_field_width(n: usize) -> usize {
 /// has to keep its place, but a screenful of zeros reads as data. Shared by the
 /// tube rows and the totals footer so the two cannot drift out of alignment —
 /// which is the whole point of the columns.
-fn count_spans(counts: &[u64; 6], columns: &[usize], emphasis: Modifier) -> Vec<Span<'static>> {
+fn count_spans(counts: &Counts, columns: &[usize], emphasis: Modifier) -> Vec<Span<'static>> {
     columns
         .iter()
         .enumerate()
@@ -954,7 +957,7 @@ fn column_block_width(columns: &[usize]) -> usize {
 /// segments within it, which made a tube holding one job look as busy as one
 /// holding a million, and a handful of buried jobs look like a third of the
 /// queue.
-fn bar_cells(counts: &[u64; 6], total: u64, max_total: u64, width: usize) -> ([usize; 6], usize) {
+fn bar_cells(counts: &Counts, total: u64, max_total: u64, width: usize) -> ([usize; STATES.len()], usize) {
     let mut cells = [0usize; STATES.len()];
     if total == 0 || max_total == 0 || width == 0 {
         return (cells, 0);
@@ -991,7 +994,7 @@ fn bar_cells(counts: &[u64; 6], total: u64, max_total: u64, width: usize) -> ([u
 /// The size bar: coloured fill for the jobs a tube holds, dim track for the rest
 /// of the scale.
 fn size_bar_spans(
-    counts: &[u64; 6],
+    counts: &Counts,
     total: u64,
     max_total: u64,
     width: usize,

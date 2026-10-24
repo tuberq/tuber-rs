@@ -48,13 +48,10 @@ fn parse_inserted(line: &str) -> Option<PutResult> {
     };
     let mut fields = rest.split_whitespace();
     let id: u64 = fields.next()?.parse().ok()?;
-    if buried {
-        return Some(PutResult { id, existing_state: None, raised_pri: None, buried });
-    }
-    let existing_state = fields.next().map(str::to_string);
-    let raised_pri = match fields.next() {
-        Some(pri) => Some(pri.parse().ok()?),
-        None => None,
+    // BURIED's trailing fields, if any, aren't a dedup's.
+    let (existing_state, raised_pri) = match buried {
+        true => (None, None),
+        false => (fields.next().map(str::to_string), fields.next().map(str::parse).transpose().ok()?),
     };
     Some(PutResult { id, existing_state, raised_pri, buried })
 }
@@ -200,15 +197,13 @@ impl TuberClient {
         let tube_names = self.list_tubes().await?;
         let mut tubes = Vec::with_capacity(tube_names.len());
         for name in &tube_names {
-            // Only a laxer server could list a name this client won't send,
-            // and there is no asking about it.
-            if check_name("tube name", name).is_err() {
-                continue;
-            }
             match self.stats_tube(name).await {
                 Ok(tube) => tubes.push(tube),
                 // Emptied, and so gone, since list-tubes named it.
                 Err(Error::NotFound) => {}
+                // A name only a laxer server would list, which this client
+                // won't send: refused before asking, so there is no asking.
+                Err(Error::InvalidInput(_)) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -227,11 +222,7 @@ impl TuberClient {
     pub async fn use_tube(&mut self, tube: &str) -> Result<String> {
         check_name("tube name", tube)?;
         self.send_line(&format!("use {tube}")).await?;
-        let line = self.read_line().await?;
-        match line.strip_prefix("USING ") {
-            Some(name) => Ok(name.to_string()),
-            None => Err(self.refusal(line).await),
-        }
+        self.read_using().await
     }
 
     /// Put a job into the currently used tube.
@@ -267,11 +258,9 @@ impl TuberClient {
         data: &[u8],
         tags: &[String],
     ) -> Result<PutResult> {
-        for tag in tags {
-            check_tag(tag)?;
-        }
         let mut cmd = format!("put {} {} {} {}", priority, delay, ttr, data.len());
         for tag in tags {
+            check_tag(tag)?;
             cmd.push(' ');
             cmd.push_str(tag);
         }
@@ -389,11 +378,7 @@ impl TuberClient {
     /// Sends: `list-tube-used\r\n` — expects: `USING <tube>\r\n`
     pub async fn list_tube_used(&mut self) -> Result<String> {
         self.send_line("list-tube-used").await?;
-        let line = self.read_line().await?;
-        match line.strip_prefix("USING ") {
-            Some(name) => Ok(name.to_string()),
-            None => Err(self.refusal(line).await),
-        }
+        self.read_using().await
     }
 
     /// Choose how this connection's reserves pick among its watched tubes.
@@ -776,20 +761,23 @@ impl TuberClient {
             let mut rest = (&mut self.reader).take(bytes as u64 + 2);
             within(deadline, rest.read_to_end(&mut body)).await
         };
-        match read {
-            Some(Ok(n)) if n == bytes + 2 => {}
-            Some(Ok(_)) => {
-                let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-body");
-                return Err(self.close(Error::Io(eof)).await);
-            }
-            Some(Err(e)) => return Err(self.close(Error::Io(e)).await),
-            None => return Err(self.close(Error::Timeout).await),
+        if self.io(read).await? != bytes + 2 {
+            return Err(self.eof("connection closed mid-body").await);
         }
         if !body.ends_with(b"\r\n") {
             return Err(self.protocol(format!("no CRLF after a {bytes}-byte body")).await);
         }
         body.truncate(bytes);
         Ok(body)
+    }
+
+    /// Read a `USING <tube>` reply, as `use` and `list-tube-used` give.
+    async fn read_using(&mut self) -> Result<String> {
+        let line = self.read_line().await?;
+        match line.strip_prefix("USING ") {
+            Some(name) => Ok(name.to_string()),
+            None => Err(self.refusal(line).await),
+        }
     }
 
     /// Parse a number out of a reply. One that doesn't parse is a reply this
@@ -835,11 +823,24 @@ impl TuberClient {
             self.writer.write_all(frame).await?;
             self.writer.flush().await
         };
-        match within(self.deadline, sent).await {
-            Some(Ok(())) => Ok(()),
+        let sent = within(self.deadline, sent).await;
+        self.io(sent).await
+    }
+
+    /// The result of a read or write against the reply deadline. One that
+    /// failed or missed it closes the connection.
+    async fn io<T>(&mut self, outcome: Option<io::Result<T>>) -> Result<T> {
+        match outcome {
+            Some(Ok(v)) => Ok(v),
             Some(Err(e)) => Err(self.close(Error::Io(e)).await),
             None => Err(self.close(Error::Timeout).await),
         }
+    }
+
+    /// The connection closed before a whole reply arrived.
+    async fn eof(&mut self, what: &str) -> Error {
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, what);
+        self.close(Error::Io(eof)).await
     }
 
     /// Allow `secs` more for the reply to a command that asked the server to
@@ -855,14 +856,10 @@ impl TuberClient {
     /// Read one reply line, without its line ending.
     async fn read_line(&mut self) -> Result<String> {
         let mut line = Vec::new();
-        match within(self.deadline, self.reader.read_until(b'\n', &mut line)).await {
-            Some(Ok(_)) if line.ends_with(b"\n") => {}
-            Some(Ok(_)) => {
-                let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed");
-                return Err(self.close(Error::Io(eof)).await);
-            }
-            Some(Err(e)) => return Err(self.close(Error::Io(e)).await),
-            None => return Err(self.close(Error::Timeout).await),
+        let read = within(self.deadline, self.reader.read_until(b'\n', &mut line)).await;
+        self.io(read).await?;
+        if !line.ends_with(b"\n") {
+            return Err(self.eof("connection closed").await);
         }
         line.pop();
         if line.ends_with(b"\r") {
@@ -935,7 +932,8 @@ mod tests {
     /// `replies[n]`, and hangs up on a command past the last. Its handle
     /// yields every line it was sent, with a `put`'s or `schedule-put`'s body
     /// as the line after it, so it resolves once the client hangs up too.
-    async fn converse(replies: &'static [&'static [u8]]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    async fn converse(replies: &[&[u8]]) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let replies: Vec<Vec<u8>> = replies.iter().map(|r| r.to_vec()).collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
@@ -943,7 +941,7 @@ mod tests {
             let (r, mut w) = stream.into_split();
             let mut r = BufReader::new(r);
             let mut sent = Vec::new();
-            let mut replies = replies.iter();
+            let mut replies = replies.into_iter();
             loop {
                 let mut line = String::new();
                 if r.read_line(&mut line).await.unwrap() == 0 {
@@ -970,7 +968,7 @@ mod tests {
                 // on one, but go on reading so the handle reports what it sent.
                 match replies.next() {
                     Some(reply) => {
-                        w.write_all(reply).await.unwrap();
+                        w.write_all(&reply).await.unwrap();
                         w.write_all(b"\r\n").await.unwrap();
                     }
                     None => w.shutdown().await.unwrap(),
@@ -1170,9 +1168,7 @@ mod tests {
             b"RESERVED_BATCH 18446744073709551615",
             b"RESERVED_BATCH 11",
         ] {
-            let replies: &'static [&'static [u8]] =
-                Box::leak(vec![bad, &b"OK 4\r\n---\n"[..]].into_boxed_slice());
-            let (addr, server) = converse(replies).await;
+            let (addr, server) = converse(&[bad, b"OK 4\r\n---\n"]).await;
             let mut c = TuberClient::connect(&addr).await.unwrap();
             let what = String::from_utf8_lossy(bad);
             let err = c.reserve_batch(10, None).await.unwrap_err();
@@ -1255,8 +1251,7 @@ mod tests {
             b"RESERVED 1 3\r\nabcXY",            // no CRLF after the body
             b"OK 5\r\nhello",                    // a body where a job was expected
         ] {
-            let replies: &'static [&'static [u8]] = Box::leak(vec![bad, &b"OK 4\r\n---\n"[..]].into_boxed_slice());
-            let (addr, server) = converse(replies).await;
+            let (addr, server) = converse(&[bad, b"OK 4\r\n---\n"]).await;
             let mut c = TuberClient::connect(&addr).await.unwrap();
             let what = String::from_utf8_lossy(bad);
             let err = c.reserve_with_timeout(0).await.unwrap_err();
@@ -1406,8 +1401,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_length_past_any_job_is_refused_not_allocated() {
         for reply in [&b"FOUND 1 99999999999"[..], b"FOUND 1 18446744073709551615", b"OK 99999999999"] {
-            let replies: &'static [&'static [u8]] = Box::leak(vec![reply].into_boxed_slice());
-            let (addr, _server) = converse(replies).await;
+            let (addr, _server) = converse(&[reply]).await;
             let mut c = TuberClient::connect(&addr).await.unwrap();
             let what = String::from_utf8_lossy(reply);
             let err = if reply.starts_with(b"OK") {

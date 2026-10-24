@@ -74,20 +74,21 @@ pub enum Error {
 
 impl Error {
     /// The error a one-word refusal from tuber stands for, if it is one.
+    /// `DEADLINE_SOON` isn't: it is a reserve's answer, read before this.
     pub(crate) fn from_reply(line: &str) -> Option<Self> {
-        Some(match line {
-            "NOT_FOUND" => Self::NotFound,
-            "DRAINING" => Self::Draining,
-            "INTERNAL_ERROR" => Self::InternalError,
-            "OUT_OF_MEMORY" => Self::OutOfMemory,
-            "OUT_OF_STORAGE" => Self::OutOfStorage,
-            "JOB_TOO_BIG" => Self::JobTooBig,
-            "BAD_FORMAT" => Self::BadFormat,
-            "UNKNOWN_COMMAND" => Self::UnknownCommand,
-            "EXPECTED_CRLF" => Self::ExpectedCrlf,
-            "NOT_IGNORED" => Self::NotIgnored,
-            _ => return None,
-        })
+        const REFUSALS: [Error; 10] = [
+            Error::NotFound,
+            Error::Draining,
+            Error::InternalError,
+            Error::OutOfMemory,
+            Error::OutOfStorage,
+            Error::JobTooBig,
+            Error::BadFormat,
+            Error::UnknownCommand,
+            Error::ExpectedCrlf,
+            Error::NotIgnored,
+        ];
+        REFUSALS.into_iter().find(|e| e.reply() == Some(line))
     }
 
     /// Tuber's word for this refusal, `NOT_FOUND` and so on; `None` for an

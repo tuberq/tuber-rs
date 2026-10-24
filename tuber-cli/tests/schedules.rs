@@ -2,9 +2,8 @@
 
 mod common;
 
-use common::{scripted_server, FakeServer};
-use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use common::{scripted_server, tuber_cli, FakeServer};
+use std::process::Output;
 
 const SPLAT: &str = r#"[
   {"name": "rollup", "tube": "splat.maintenance", "cron": "5 * * * *",
@@ -15,18 +14,8 @@ const SPLAT: &str = r#"[
    "body": "{\"class\":\"DataRetentionJob\",\"args\":[]}"}
 ]"#;
 
-/// Run tuber-cli against `server` with `stdin` piped in.
 fn run(server: &FakeServer, args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr])
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
-    child.wait_with_output().unwrap()
+    tuber_cli(server, args, stdin.as_bytes())
 }
 
 fn json(out: &Output) -> serde_json::Value {

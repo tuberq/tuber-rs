@@ -5,6 +5,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -68,6 +69,20 @@ pub fn scripted_server(replies: &[&'static [u8]]) -> FakeServer {
         }
     });
     FakeServer { addr, received }
+}
+
+/// Run tuber-cli against `server` with `args`, and `stdin` on its stdin.
+pub fn tuber_cli(server: &FakeServer, args: &[&str], stdin: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
+        .args(["--addr", &server.addr])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    child.wait_with_output().unwrap()
 }
 
 impl FakeServer {

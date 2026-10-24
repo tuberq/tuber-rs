@@ -3,8 +3,7 @@
 
 mod common;
 
-use common::scripted_server;
-use std::process::Command;
+use common::{scripted_server, tuber_cli};
 
 /// `stats-tube $'default\r\nflush-tube victim'` once exited 0 and emptied
 /// `victim`. It must fail without sending anything.
@@ -13,11 +12,7 @@ fn a_name_with_a_crlf_does_not_reach_the_server() {
     // Answers for both halves, so the old behaviour shows as a success and a
     // flush rather than as a hang.
     let server = scripted_server(&[b"OK 4\r\n---\n\r\n", b"FLUSHED 3\r\n"]);
-    let out = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr])
-        .args(["stats-tube", "default\r\nflush-tube victim"])
-        .output()
-        .unwrap();
+    let out = tuber_cli(&server, &["stats-tube", "default\r\nflush-tube victim"], b"");
     assert!(!out.status.success(), "status: {:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("invalid tube name"), "stderr: {stderr}");
@@ -28,11 +23,7 @@ fn a_name_with_a_crlf_does_not_reach_the_server() {
 #[test]
 fn a_tag_with_a_space_does_not_reach_the_server() {
     let server = scripted_server(&[b"USING default\r\n", b"INSERTED 1\r\n"]);
-    let out = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr])
-        .args(["put", "--group", "batch-1 aft:batch-1", "{}"])
-        .output()
-        .unwrap();
+    let out = tuber_cli(&server, &["put", "--group", "batch-1 aft:batch-1", "{}"], b"");
     assert!(!out.status.success(), "status: {:?}", out.status);
     let sent = server.transcript();
     assert!(!sent.iter().any(|l| l.starts_with("put")), "sent: {sent:?}");
@@ -42,10 +33,7 @@ fn a_tag_with_a_space_does_not_reach_the_server() {
 #[test]
 fn a_bare_delete_batch_is_a_usage_error() {
     let server = scripted_server(&[b"DELETED_BATCH 0 0\r\n"]);
-    let out = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
-        .args(["--addr", &server.addr, "delete-batch"])
-        .output()
-        .unwrap();
+    let out = tuber_cli(&server, &["delete-batch"], b"");
     assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(server.transcript().is_empty(), "sent: {:?}", server.transcript());
 }
