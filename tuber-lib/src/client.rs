@@ -650,18 +650,11 @@ impl TuberClient {
         allow_empty: bool,
     ) -> Result<SyncResult> {
         schedule::validate_sync(owner, entries, allow_empty)?;
-        let refused = |entry: Option<&str>, status: String| {
-            Error::ScheduleSync(ScheduleSyncError {
-                owner: owner.to_string(),
-                entry: entry.map(str::to_string),
-                status,
-            })
-        };
 
         self.send_line(&format!("schedule-begin {owner}")).await?;
         let line = self.read_line().await?;
         if line != format!("SYNCING {owner}") {
-            return Err(refused(None, line));
+            return Err(self.sync_refusal(owner, None, line).await);
         }
 
         for entry in entries {
@@ -674,15 +667,38 @@ impl TuberClient {
                 // has discarded the staged set anyway, and the refusal is
                 // what the caller needs to hear.
                 if self.send_line("schedule-abort").await.is_ok() {
-                    let _ = self.read_line().await;
+                    match self.read_line().await.as_deref() {
+                        Ok("ABORTED" | "NOT_SYNCING") | Err(_) => {}
+                        // Not a state this client can know the connection is in.
+                        Ok(other) => _ = self.protocol(format!("{other:?} to schedule-abort")).await,
+                    }
                 }
-                return Err(refused(Some(&entry.name), line));
+                return Err(self.sync_refusal(owner, Some(&entry.name), line).await);
             }
         }
 
         self.send_line("schedule-commit").await?;
         let line = self.read_line().await?;
-        SyncResult::parse(&line).ok_or_else(|| refused(None, line))
+        match SyncResult::parse(&line) {
+            Some(result) => Ok(result),
+            None => Err(self.sync_refusal(owner, None, line).await),
+        }
+    }
+
+    /// The error for a sync reply that isn't the one expected. Tuber refuses a
+    /// sync in one word, which is reported against the owner and entry; any
+    /// other reply, and `EXPECTED_CRLF`, closes the connection as it would for
+    /// any command.
+    async fn sync_refusal(&mut self, owner: &str, entry: Option<&str>, line: String) -> Error {
+        let one_word = !line.is_empty() && line.bytes().all(|b| b.is_ascii_uppercase() || b == b'_');
+        if !one_word || Error::from_reply(&line).is_some_and(|e| e.is_fatal()) {
+            return self.refusal(line).await;
+        }
+        Error::ScheduleSync(ScheduleSyncError {
+            owner: owner.to_string(),
+            entry: entry.map(str::to_string),
+            status: line,
+        })
     }
 
     /// Expect a single-word response (e.g. "DELETED", "BURIED", "PAUSED").
@@ -1056,6 +1072,45 @@ mod tests {
             .unwrap_err();
         let e = sync_error(&err);
         assert_eq!((e.entry.as_deref(), e.status.as_str()), (Some("retention"), "BAD_SCHEDULE"));
+    }
+
+    /// A sync's refusals are tuber's one-word replies. Anything else is a
+    /// reply this client can't follow, and EXPECTED_CRLF means tuber has hung
+    /// up: either way the connection is done, as for any other command.
+    #[tokio::test]
+    async fn a_sync_reply_that_is_no_refusal_closes_the_connection() {
+        let cases: [&[&[u8]]; 4] = [
+            &[b"OK 12"],
+            &[b"SYNCING splat", b"STAGED 1"],
+            &[b"SYNCING splat", b"EXPECTED_CRLF"],
+            &[b"SYNCING splat", b"STAGED", b"SYNCED 1 2"],
+        ];
+        for replies in cases {
+            let (addr, _server) = converse(replies).await;
+            let mut client = TuberClient::connect(&addr).await.unwrap();
+            let err = client
+                .sync_schedules("splat", &[entry("rollup", "5 * * * *")], false)
+                .await
+                .unwrap_err();
+            assert!(err.is_fatal(), "{replies:?}: {err:?}");
+            assert!(matches!(client.stats().await.unwrap_err(), Error::Closed), "{replies:?}");
+        }
+    }
+
+    /// The abort after a refused entry is answered `ABORTED`. Any other
+    /// answer leaves the connection in a state the client can't know, so it
+    /// is closed, but the refusal is still what the caller hears.
+    #[tokio::test]
+    async fn an_abort_answered_oddly_closes_the_connection() {
+        let (addr, _server) = converse(&[b"SYNCING splat", b"BAD_SCHEDULE", b"OK 12"]).await;
+        let mut client = TuberClient::connect(&addr).await.unwrap();
+        let err = client
+            .sync_schedules("splat", &[entry("retention", "0 2 * * * Australia/Melborne")], false)
+            .await
+            .unwrap_err();
+        let e = sync_error(&err);
+        assert_eq!((e.entry.as_deref(), e.status.as_str()), (Some("retention"), "BAD_SCHEDULE"));
+        assert!(matches!(client.stats().await.unwrap_err(), Error::Closed));
     }
 
     #[tokio::test]

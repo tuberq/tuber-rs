@@ -25,8 +25,9 @@ fn a_tag_with_a_space_does_not_reach_the_server() {
     let server = scripted_server(&[b"USING default\r\n", b"INSERTED 1\r\n"]);
     let out = tuber_cli(&server, &["put", "--group", "batch-1 aft:batch-1", "{}"], b"");
     assert!(!out.status.success(), "status: {:?}", out.status);
+    // Not even the `use`: a refused argument sends nothing.
     let sent = server.transcript();
-    assert!(!sent.iter().any(|l| l.starts_with("put")), "sent: {sent:?}");
+    assert!(sent.is_empty(), "sent: {sent:?}");
 }
 
 /// `delete-batch` with no ids is a mistake, not a request to delete nothing.

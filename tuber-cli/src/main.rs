@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 use std::fmt;
 use std::io::{Read, Write};
 use std::process::ExitCode;
-use tuber_lib::{tag, Job, Reserved, TuberClient};
+use tuber_lib::schedule::{validate_sync, ScheduleEntry};
+use tuber_lib::{check_name, tag, Job, Reserved, TuberClient};
 
 mod schedule_file;
 
@@ -346,7 +347,100 @@ fn classify(err: &anyhow::Error) -> (&str, u8) {
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+/// What a command sends beyond its arguments, read and checked before
+/// connecting.
+enum Input {
+    None,
+    Put { data: Vec<u8>, tags: Vec<String> },
+    Sync(Vec<ScheduleEntry>),
+}
+
+/// Refuse here what would be refused anyway, before connecting: a bad
+/// argument then exits 2 whether a server is up or not, and sends nothing,
+/// not even a `use`. The client checks each name again as it sends it, so a
+/// command missing here is still refused, only after connecting.
+fn prepare(command: &mut Command) -> anyhow::Result<Input> {
+    match command {
+        Command::StatsTube { name: tube }
+        | Command::Kick { tube, .. }
+        | Command::PeekReady { tube }
+        | Command::PeekBuried { tube }
+        | Command::PeekDelayed { tube }
+        | Command::FlushTube { tube }
+        | Command::FlushBuried { tube }
+        | Command::Pause { tube, .. }
+        | Command::Reserve { tube: Some(tube), .. }
+        | Command::ReserveBatch { tube: Some(tube), .. } => check_name("tube name", tube)?,
+        Command::StatsGroup { name } => check_name("group name", name)?,
+        Command::ListSchedules { owner: Some(owner) } => check_name("schedule owner", owner)?,
+        Command::StatsSchedule { owner, name } => {
+            check_name("schedule owner", owner)?;
+            check_name("schedule name", name)?;
+        }
+        Command::Put { body, tube, idempotent, idempotent_ttl, group, after, concurrency, .. } => {
+            check_name("tube name", tube)?;
+            let mut tags = Vec::new();
+            if let Some(key) = idempotent {
+                tags.push(match idempotent_ttl {
+                    Some(ttl) => tag::idp_for(key, *ttl)?,
+                    None => tag::idp(key)?,
+                });
+            }
+            if let Some(g) = group {
+                tags.push(tag::group(g)?);
+            }
+            if let Some(a) = after {
+                tags.push(tag::after(a)?);
+            }
+            if let Some(c) = concurrency {
+                tags.push(match c.rsplit_once(':') {
+                    Some((key, limit)) => {
+                        let limit = limit.parse().map_err(|_| {
+                            Failure::Usage(format!("--concurrency {c}: the limit after the colon must be a number"))
+                        })?;
+                        tag::concurrency_limit(key, limit)?
+                    }
+                    None => tag::concurrency(c)?,
+                });
+            }
+            let data = match body.take() {
+                // On Unix these are the argument's own bytes.
+                Some(b) => b.into_encoded_bytes(),
+                None => {
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf)?;
+                    buf
+                }
+            };
+            return Ok(Input::Put { data, tags });
+        }
+        Command::ScheduleSync { owner, file, allow_empty } => {
+            let json = if file == "-" {
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&*file).with_context(|| format!("reading {file}"))?
+            };
+            let entries = schedule_file::parse(&json)?;
+            if entries.is_empty() && !*allow_empty {
+                let source = if file == "-" { "stdin" } else { file.as_str() };
+                return Err(Failure::Usage(format!(
+                    "{source} has no entries, and syncing none removes all of {owner}'s \
+                     schedules; pass --allow-empty if that's meant"
+                ))
+                .into());
+            }
+            validate_sync(owner, &entries, *allow_empty)?;
+            return Ok(Input::Sync(entries));
+        }
+        _ => {}
+    }
+    Ok(Input::None)
+}
+
+async fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
+    let input = prepare(&mut cli.command)?;
     let addr = tuber_lib::server_addr(cli.addr.as_deref());
     let mut client = TuberClient::connect(&addr).await?;
 
@@ -366,52 +460,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             output(&cli.format, &stats)?;
         }
 
-        Command::Put {
-            body,
-            tube,
-            priority,
-            delay,
-            ttr,
-            idempotent,
-            idempotent_ttl,
-            group,
-            after,
-            concurrency,
-        } => {
+        Command::Put { tube, priority, delay, ttr, .. } => {
+            let Input::Put { data, tags } = input else { unreachable!("prepare reads a put's input") };
             client.use_tube(&tube).await?;
-            let data = match body {
-                // On Unix these are the argument's own bytes.
-                Some(b) => b.into_encoded_bytes(),
-                None => {
-                    let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf)?;
-                    buf
-                }
-            };
-            let mut tags = Vec::new();
-            if let Some(key) = idempotent {
-                tags.push(match idempotent_ttl {
-                    Some(ttl) => tag::idp_for(&key, ttl)?,
-                    None => tag::idp(&key)?,
-                });
-            }
-            if let Some(g) = group {
-                tags.push(tag::group(&g)?);
-            }
-            if let Some(a) = after {
-                tags.push(tag::after(&a)?);
-            }
-            if let Some(c) = concurrency {
-                tags.push(match c.rsplit_once(':') {
-                    Some((key, limit)) => {
-                        let limit = limit.parse().map_err(|_| {
-                            Failure::Usage(format!("--concurrency {c}: the limit after the colon must be a number"))
-                        })?;
-                        tag::concurrency_limit(key, limit)?
-                    }
-                    None => tag::concurrency(&c)?,
-                });
-            }
             let res = client.put_tagged(priority, delay, ttr, &data, &tags).await?;
             // A dedup against a buried job is still not a failure, but nothing
             // was queued and nothing runs until that job is kicked. Run from
@@ -561,23 +612,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             output(&cli.format, &stats)?;
         }
 
-        Command::ScheduleSync { owner, file, allow_empty } => {
-            let json = if file == "-" {
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf)?;
-                buf
-            } else {
-                std::fs::read_to_string(&file).with_context(|| format!("reading {file}"))?
-            };
-            let entries = schedule_file::parse(&json)?;
-            if entries.is_empty() && !allow_empty {
-                let source = if file == "-" { "stdin" } else { file.as_str() };
-                return Err(Failure::Usage(format!(
-                    "{source} has no entries, and syncing none removes all of {owner}'s \
-                     schedules; pass --allow-empty if that's meant"
-                ))
-                .into());
-            }
+        Command::ScheduleSync { owner, allow_empty, .. } => {
+            let Input::Sync(entries) = input else { unreachable!("prepare reads a sync's entries") };
             let result = client.sync_schedules(&owner, &entries, allow_empty).await?;
             output(
                 &cli.format,

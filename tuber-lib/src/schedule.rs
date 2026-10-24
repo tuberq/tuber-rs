@@ -90,8 +90,11 @@ impl ScheduleEntry {
 }
 
 /// Check a whole sync before any of it is sent: every entry valid, no name
-/// twice, and no empty set unless the caller means it.
-pub(crate) fn validate_sync(owner: &str, entries: &[ScheduleEntry], allow_empty: bool) -> Result<()> {
+/// twice, and no empty set unless the caller means it. [`sync_schedules`]
+/// does this itself; call it to refuse a bad set before connecting.
+///
+/// [`sync_schedules`]: crate::client::TuberClient::sync_schedules
+pub fn validate_sync(owner: &str, entries: &[ScheduleEntry], allow_empty: bool) -> Result<()> {
     check_name("schedule owner", owner)?;
     if entries.is_empty() && !allow_empty {
         return Err(Error::InvalidInput(format!(

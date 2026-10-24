@@ -76,3 +76,30 @@ fn text_format_errors_are_one_plain_line() {
     assert_eq!(String::from_utf8_lossy(&out.stderr), "Error: NOT_FOUND\n");
     assert_eq!(out.status.code(), Some(3));
 }
+
+/// A bad argument is refused before connecting, so it exits 2 whether a
+/// server is up or not, rather than 6 when none is.
+#[test]
+fn a_bad_argument_exits_2_with_no_server_up() {
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let dir = env!("CARGO_TARGET_TMPDIR");
+    let bad_entry = format!("{dir}/bad-entry.json");
+    std::fs::write(&bad_entry, r#"[{"name":"r","tube":"two words","spec":"@daily","body":"x"}]"#).unwrap();
+    let missing = format!("{dir}/no-such-schedule-file.json");
+    let cases: [(&[&str], &str, i32); 10] = [
+        (&["stats-tube", "two words"], "INVALID_INPUT", 2),
+        (&["put", "--tube", "two words", "x"], "INVALID_INPUT", 2),
+        (&["put", "--group", "two words", "x"], "INVALID_INPUT", 2),
+        (&["put", "--concurrency", "k:many", "x"], "INVALID_INPUT", 2),
+        (&["reserve", "--tube", "two words"], "INVALID_INPUT", 2),
+        (&["peek-ready", "--tube", "two words"], "INVALID_INPUT", 2),
+        (&["stats-group", "two words"], "INVALID_INPUT", 2),
+        (&["stats-schedule", "ops", "two words"], "INVALID_INPUT", 2),
+        (&["schedule-sync", "ops", &bad_entry], "INVALID_INPUT", 2),
+        (&["schedule-sync", "ops", &missing], "ERROR", 1),
+    ];
+    for (args, error, exit) in cases {
+        let (err, code) = failure(&run_at(&addr, args));
+        assert_eq!((err["error"].as_str(), code), (Some(error), Some(exit)), "{args:?}: {err}");
+    }
+}

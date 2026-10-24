@@ -9,8 +9,11 @@ pub(crate) const MAX_NAME_LEN: usize = 200;
 
 /// Check a tube, group, owner or entry name against tuber's tube-name rules:
 /// up to 200 bytes of letters, digits and `- + / ; . $ _ ( )`, not starting
-/// with `-`.
-pub(crate) fn check_name(what: &str, name: &str) -> Result<()> {
+/// with `-`. `what` names it in the error: `"tube name"`, say.
+///
+/// Every method that sends a name checks it first, so there is no need to
+/// call this before one; it is for refusing a bad name before connecting.
+pub fn check_name(what: &str, name: &str) -> Result<()> {
     if !is_valid_name(name) {
         return Err(Error::InvalidInput(format!("invalid {what} {name:?}")));
     }

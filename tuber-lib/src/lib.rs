@@ -42,7 +42,7 @@ pub mod parse;
 pub mod schedule;
 
 pub use client::{Job, PutResult, ReserveMode, Reserved, TuberClient};
-pub use name::tag;
+pub use name::{check_name, tag};
 pub use error::{Error, Result};
 
 const DEFAULT_HOST: &str = "localhost";
