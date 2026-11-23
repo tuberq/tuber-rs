@@ -52,6 +52,11 @@ pub enum Error {
     JobTooBig,
     /// `BAD_FORMAT`: the server couldn't parse the command.
     BadFormat,
+    /// `BAD_FORMAT CYCLE`: a put whose `aft:` group already waits on its
+    /// `grp:` group, directly or through other groups, or is the same group,
+    /// so neither could ever complete. Nothing was stored, and a retry gets
+    /// the same answer until the groups' jobs move on.
+    Cycle,
     /// `UNKNOWN_COMMAND`: the server doesn't have this command; an older
     /// tuber, or beanstalkd for a tuber extension.
     UnknownCommand,
@@ -73,10 +78,11 @@ pub enum Error {
 }
 
 impl Error {
-    /// The error a one-word refusal from tuber stands for, if it is one.
+    /// The error a refusal from tuber stands for, if it is one: a word, or
+    /// two for `BAD_FORMAT CYCLE`.
     /// `DEADLINE_SOON` isn't: it is a reserve's answer, read before this.
     pub(crate) fn from_reply(line: &str) -> Option<Self> {
-        const REFUSALS: [Error; 10] = [
+        const REFUSALS: [Error; 11] = [
             Error::NotFound,
             Error::Draining,
             Error::InternalError,
@@ -84,6 +90,7 @@ impl Error {
             Error::OutOfStorage,
             Error::JobTooBig,
             Error::BadFormat,
+            Error::Cycle,
             Error::UnknownCommand,
             Error::ExpectedCrlf,
             Error::NotIgnored,
@@ -102,6 +109,7 @@ impl Error {
             Self::OutOfStorage => "OUT_OF_STORAGE",
             Self::JobTooBig => "JOB_TOO_BIG",
             Self::BadFormat => "BAD_FORMAT",
+            Self::Cycle => "BAD_FORMAT CYCLE",
             Self::UnknownCommand => "UNKNOWN_COMMAND",
             Self::ExpectedCrlf => "EXPECTED_CRLF",
             Self::NotIgnored => "NOT_IGNORED",

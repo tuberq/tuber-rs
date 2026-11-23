@@ -937,6 +937,24 @@ mod tests {
         assert!(server.await.unwrap().is_empty());
     }
 
+    /// A put that would close a cycle of groups waiting on each other is
+    /// refused with two words, `BAD_FORMAT CYCLE`. It is one of tuber's
+    /// refusals, not a reply the client can't read, so the connection stays.
+    #[tokio::test]
+    async fn a_put_refused_as_a_cycle_leaves_the_connection_usable() {
+        let (addr, server) = converse(&[b"BAD_FORMAT CYCLE", b"INSERTED 2"]).await;
+        let mut c = TuberClient::connect(&addr).await.unwrap();
+        let tags = ["grp:x".to_string(), "aft:y".to_string()];
+        let err = c.put_tagged(0, 0, 60, b"a", &tags).await.unwrap_err();
+        assert!(matches!(err, Error::Cycle), "{err:?}");
+        assert_eq!(err.reply(), Some("BAD_FORMAT CYCLE"));
+        assert!(!err.is_fatal(), "{err:?}");
+        assert_eq!(err.to_string(), "BAD_FORMAT CYCLE");
+        assert_eq!(c.put(0, 0, 60, b"b").await.unwrap(), 2);
+        drop(c);
+        server.await.unwrap();
+    }
+
     #[test]
     fn rejects_non_inserted_replies() {
         for line in ["DRAINING", "BAD_FORMAT", "EXPECTED_CRLF", "JOB_TOO_BIG", "INSERTED", "BURIED"] {
