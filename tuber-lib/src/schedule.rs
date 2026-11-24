@@ -161,6 +161,11 @@ pub struct ScheduleSyncError {
     pub entry: Option<String>,
     /// Tuber's reply: `BAD_SCHEDULE`, `OUT_OF_MEMORY`, `INTERNAL_ERROR`, …
     pub status: String,
+    /// True when the client closed the connection after the refusal: the
+    /// `schedule-abort` that follows a refused entry failed, or was answered
+    /// with something other than `ABORTED`. [`Error::is_fatal`] then says so
+    /// too; reconnect to go on.
+    pub closed: bool,
 }
 
 impl ScheduleSyncError {
@@ -175,7 +180,7 @@ impl ScheduleSyncError {
 
 impl fmt::Display for ScheduleSyncError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { owner, entry, status } = self;
+        let Self { owner, entry, status, closed } = self;
         match entry {
             Some(entry) => write!(
                 f,
@@ -192,7 +197,11 @@ impl fmt::Display for ScheduleSyncError {
                 "this server has no recurring schedules ({status}): they need tuber 0.16.0 or later"
             ),
             None => write!(f, "tuber refused the schedule sync for {owner}: {status}; nothing changed"),
+        }?;
+        if *closed {
+            f.write_str(" (the connection to tuber is closed)")?;
         }
+        Ok(())
     }
 }
 
@@ -380,6 +389,7 @@ mod tests {
             owner: "splat".into(),
             entry: entry.map(String::from),
             status: status.into(),
+            closed: false,
         };
         assert!(err(None, "INTERNAL_ERROR").is_live());
         assert!(err(None, "INTERNAL_ERROR").to_string().contains("is live"));

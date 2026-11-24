@@ -698,6 +698,8 @@ impl TuberClient {
             owner: owner.to_string(),
             entry: entry.map(str::to_string),
             status: line,
+            // The abort after a refused entry may have closed it.
+            closed: self.closed,
         })
     }
 
@@ -1069,6 +1071,7 @@ mod tests {
         let e = sync_error(&err);
         assert_eq!((e.entry.as_deref(), e.status.as_str()), (Some("retention"), "BAD_SCHEDULE"));
         assert!(!e.is_live());
+        assert!(!err.is_fatal(), "the abort was answered ABORTED: {err:?}");
         drop(client);
         let sent = server.await.unwrap();
         assert_eq!(sent.last().map(String::as_str), Some("schedule-abort"));
@@ -1078,7 +1081,8 @@ mod tests {
 
     /// The refusal is what the caller needs to hear. A connection that drops
     /// before the abort is answered has discarded the staged set anyway, so
-    /// losing it must not swap the entry's name for "connection closed".
+    /// losing it must not swap the entry's name for "connection closed". The
+    /// connection is gone all the same, and the error says so.
     #[tokio::test]
     async fn a_refusal_is_reported_even_if_the_abort_fails() {
         // No reply scripted for schedule-abort: the server hangs up instead.
@@ -1090,6 +1094,8 @@ mod tests {
             .unwrap_err();
         let e = sync_error(&err);
         assert_eq!((e.entry.as_deref(), e.status.as_str()), (Some("retention"), "BAD_SCHEDULE"));
+        assert!(err.is_fatal(), "the connection closed under the abort: {err:?}");
+        assert!(matches!(client.stats().await.unwrap_err(), Error::Closed));
     }
 
     /// A sync's refusals are tuber's one-word replies. Anything else is a
@@ -1117,7 +1123,8 @@ mod tests {
 
     /// The abort after a refused entry is answered `ABORTED`. Any other
     /// answer leaves the connection in a state the client can't know, so it
-    /// is closed, but the refusal is still what the caller hears.
+    /// is closed, but the refusal is still what the caller hears, marked
+    /// fatal so a caller that goes by `is_fatal()` reconnects.
     #[tokio::test]
     async fn an_abort_answered_oddly_closes_the_connection() {
         let (addr, _server) = converse(&[b"SYNCING splat", b"BAD_SCHEDULE", b"OK 12"]).await;
@@ -1128,6 +1135,8 @@ mod tests {
             .unwrap_err();
         let e = sync_error(&err);
         assert_eq!((e.entry.as_deref(), e.status.as_str()), (Some("retention"), "BAD_SCHEDULE"));
+        assert!(err.is_fatal(), "closed after an odd abort: {err:?}");
+        assert!(err.to_string().ends_with("(the connection to tuber is closed)"), "{err}");
         assert!(matches!(client.stats().await.unwrap_err(), Error::Closed));
     }
 

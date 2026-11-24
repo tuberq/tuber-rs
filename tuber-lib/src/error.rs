@@ -120,10 +120,13 @@ impl Error {
 
     /// True when this error closed the connection: reconnect to go on.
     pub fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            Self::Io(_) | Self::Timeout | Self::Protocol(_) | Self::Closed | Self::ExpectedCrlf
-        )
+        match self {
+            Self::Io(_) | Self::Timeout | Self::Protocol(_) | Self::Closed | Self::ExpectedCrlf => {
+                true
+            }
+            Self::ScheduleSync(e) => e.closed,
+            _ => false,
+        }
     }
 }
 
@@ -196,6 +199,7 @@ mod tests {
             owner: "splat".into(),
             entry: Some("rollup".into()),
             status: "BAD_SCHEDULE".into(),
+            closed: false,
         });
         assert_eq!(chain(&sync).len(), 1, "{:?}", chain(&sync));
     }
