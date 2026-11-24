@@ -103,3 +103,32 @@ fn a_bad_argument_exits_2_with_no_server_up() {
         assert_eq!((err["error"].as_str(), code), (Some(error), Some(exit)), "{args:?}: {err}");
     }
 }
+
+/// With no server, `put` fails at once rather than first reading a body
+/// from stdin that may be a long time coming, or never come at all.
+#[test]
+fn put_with_no_server_fails_without_waiting_for_stdin() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tuber-cli"))
+        .args(["--addr", &addr, "put"])
+        // Held open, and never written to.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            child.kill().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.and_then(|s| s.code()), Some(6), "still waiting on stdin after 5s");
+}

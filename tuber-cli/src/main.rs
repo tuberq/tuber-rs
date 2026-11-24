@@ -347,11 +347,12 @@ fn classify(err: &anyhow::Error) -> (&str, u8) {
     }
 }
 
-/// What a command sends beyond its arguments, read and checked before
-/// connecting.
+/// What a command sends beyond its arguments, built and checked before
+/// connecting. A put's body is read after: from stdin it may be a long time
+/// coming, and with no server up the put should fail at once.
 enum Input {
     None,
-    Put { data: Vec<u8>, tags: Vec<String> },
+    Put { tags: Vec<String> },
     Sync(Vec<ScheduleEntry>),
 }
 
@@ -359,7 +360,7 @@ enum Input {
 /// argument then exits 2 whether a server is up or not, and sends nothing,
 /// not even a `use`. The client checks each name again as it sends it, so a
 /// command missing here is still refused, only after connecting.
-fn prepare(command: &mut Command) -> anyhow::Result<Input> {
+fn prepare(command: &Command) -> anyhow::Result<Input> {
     match command {
         Command::StatsTube { name: tube }
         | Command::Kick { tube, .. }
@@ -377,7 +378,7 @@ fn prepare(command: &mut Command) -> anyhow::Result<Input> {
             check_name("schedule owner", owner)?;
             check_name("schedule name", name)?;
         }
-        Command::Put { body, tube, idempotent, idempotent_ttl, group, after, concurrency, .. } => {
+        Command::Put { tube, idempotent, idempotent_ttl, group, after, concurrency, .. } => {
             check_name("tube name", tube)?;
             let mut tags = Vec::new();
             if let Some(key) = idempotent {
@@ -403,16 +404,7 @@ fn prepare(command: &mut Command) -> anyhow::Result<Input> {
                     None => tag::concurrency(c)?,
                 });
             }
-            let data = match body.take() {
-                // On Unix these are the argument's own bytes.
-                Some(b) => b.into_encoded_bytes(),
-                None => {
-                    let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf)?;
-                    buf
-                }
-            };
-            return Ok(Input::Put { data, tags });
+            return Ok(Input::Put { tags });
         }
         Command::ScheduleSync { owner, file, allow_empty } => {
             let json = if file == "-" {
@@ -420,7 +412,7 @@ fn prepare(command: &mut Command) -> anyhow::Result<Input> {
                 std::io::stdin().read_to_string(&mut buf)?;
                 buf
             } else {
-                std::fs::read_to_string(&*file).with_context(|| format!("reading {file}"))?
+                std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?
             };
             let entries = schedule_file::parse(&json)?;
             if entries.is_empty() && !*allow_empty {
@@ -439,8 +431,8 @@ fn prepare(command: &mut Command) -> anyhow::Result<Input> {
     Ok(Input::None)
 }
 
-async fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
-    let input = prepare(&mut cli.command)?;
+async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    let input = prepare(&cli.command)?;
     let addr = tuber_lib::server_addr(cli.addr.as_deref());
     let mut client = TuberClient::connect(&addr).await?;
 
@@ -460,9 +452,18 @@ async fn run(mut cli: Cli) -> anyhow::Result<ExitCode> {
             output(&cli.format, &stats)?;
         }
 
-        Command::Put { tube, priority, delay, ttr, .. } => {
-            let Input::Put { data, tags } = input else { unreachable!("prepare reads a put's input") };
+        Command::Put { body, tube, priority, delay, ttr, .. } => {
+            let Input::Put { tags } = input else { unreachable!("prepare builds a put's tags") };
             client.use_tube(&tube).await?;
+            let data = match body {
+                // On Unix these are the argument's own bytes.
+                Some(b) => b.into_encoded_bytes(),
+                None => {
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf)?;
+                    buf
+                }
+            };
             let res = client.put_tagged(priority, delay, ttr, &data, &tags).await?;
             // A dedup against a buried job is still not a failure, but nothing
             // was queued and nothing runs until that job is kicked. Run from
