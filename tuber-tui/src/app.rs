@@ -304,20 +304,34 @@ impl App {
     }
 
     /// Get rates for server-level throughput counters.
-    pub fn server_rates(&self) -> (f64, f64, f64, f64) {
-        if let (Some(cur), Some(prev)) = (&self.current, &self.previous) {
-            let puts = self.rate(cur.server.cmd_put, prev.server.cmd_put);
-            let reserves = self.rate(
-                cur.server.cmd_reserve + cur.server.cmd_reserve_with_timeout,
-                prev.server.cmd_reserve + prev.server.cmd_reserve_with_timeout,
-            );
-            let deletes = self.rate(cur.server.cmd_delete, prev.server.cmd_delete);
-            let timeouts = self.rate(cur.server.job_timeouts, prev.server.job_timeouts);
-            (puts, reserves, deletes, timeouts)
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
+    pub fn server_rates(&self) -> ServerRates {
+        let (Some(cur), Some(prev)) = (&self.current, &self.previous) else {
+            return ServerRates::default();
+        };
+        let (cur, prev) = (&cur.server, &prev.server);
+        ServerRates {
+            puts: self.rate(cur.cmd_put, prev.cmd_put),
+            reserves: self.rate(
+                cur.cmd_reserve + cur.cmd_reserve_with_timeout,
+                prev.cmd_reserve + prev.cmd_reserve_with_timeout,
+            ),
+            deletes: self.rate(cur.cmd_delete, prev.cmd_delete),
+            timeouts: self.rate(cur.job_timeouts, prev.job_timeouts),
+            disconnects: self.rate(cur.job_disconnects, prev.job_disconnects),
         }
     }
+}
+
+/// Server-wide counters as per-second rates over the last poll. Named rather
+/// than a tuple: five figures of one type are too easy to read in the wrong
+/// order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ServerRates {
+    pub puts: f64,
+    pub reserves: f64,
+    pub deletes: f64,
+    pub timeouts: f64,
+    pub disconnects: f64,
 }
 
 /// Reasons a tube stays on screen even when empty tubes are hidden, beyond

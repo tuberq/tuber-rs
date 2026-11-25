@@ -29,6 +29,13 @@ pub struct ServerStats {
     pub cmd_reserve_with_timeout: u64,
     pub cmd_delete: u64,
     pub job_timeouts: u64,
+    /// Jobs put back because the connection holding them closed: a worker
+    /// that died or quit mid-job (tuber 0.17.0-dev.4). With `job_timeouts`,
+    /// the two ways a job goes back without its worker saying so. In memory
+    /// on the server, so it starts at 0 when the server does; 0 from older
+    /// servers and beanstalkd, which do not send it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub job_disconnects: u64,
     pub total_jobs: u64,
     pub rusage_utime: f64,
     pub rusage_stime: f64,
@@ -102,6 +109,7 @@ impl ServerStats {
             cmd_reserve_with_timeout: get_u64(&m, "cmd-reserve-with-timeout"),
             cmd_delete: get_u64(&m, "cmd-delete"),
             job_timeouts: get_u64(&m, "job-timeouts"),
+            job_disconnects: get_u64(&m, "job-disconnects"),
             total_jobs: get_u64(&m, "total-jobs"),
             rusage_utime: get_f64(&m, "rusage-utime"),
             rusage_stime: get_f64(&m, "rusage-stime"),
@@ -163,6 +171,9 @@ pub struct TubeStats {
     pub current_waiting: u64,
     pub total_reserves: u64,
     pub total_timeouts: u64,
+    /// The tube's share of `ServerStats::job_disconnects`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub total_disconnects: u64,
     pub total_buries: u64,
     pub oldest_ready_id: u64,
     pub oldest_ready_age: u64,
@@ -231,6 +242,7 @@ impl TubeStats {
             current_waiting: get_u64(&m, "current-waiting"),
             total_reserves: get_u64(&m, "total-reserves"),
             total_timeouts: get_u64(&m, "total-timeouts"),
+            total_disconnects: get_u64(&m, "total-disconnects"),
             total_buries: get_u64(&m, "total-buries"),
             oldest_ready_id: get_u64(&m, "oldest-ready-id"),
             oldest_ready_age: get_u64(&m, "oldest-ready-age"),
@@ -281,6 +293,11 @@ pub struct JobStats {
     pub time_reserved: u64,
     pub reserves: u64,
     pub timeouts: u64,
+    /// Times this job went back because the connection holding it closed.
+    /// Unlike `timeouts`, the server keeps it in memory only, so it restarts
+    /// from 0 when the server does.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub disconnects: u64,
     pub releases: u64,
     pub buries: u64,
     pub kicks: u64,
@@ -308,6 +325,7 @@ impl JobStats {
             time_reserved: get_u64(&m, "time-reserved"),
             reserves: get_u64(&m, "reserves"),
             timeouts: get_u64(&m, "timeouts"),
+            disconnects: get_u64(&m, "disconnects"),
             releases: get_u64(&m, "releases"),
             buries: get_u64(&m, "buries"),
             kicks: get_u64(&m, "kicks"),
@@ -464,6 +482,15 @@ queue-time-samples: 28089
     fn held_defaults_to_zero_when_absent() {
         assert_eq!(TubeStats::from_yaml(PAUSED_TUBE).current_jobs_held, 0);
         assert_eq!(ServerStats::from_yaml("---\nversion: 1.13\n").current_jobs_held, 0);
+    }
+
+    #[test]
+    fn parses_disconnects_at_each_level() {
+        assert_eq!(ServerStats::from_yaml("---\njob-disconnects: 5\n").job_disconnects, 5);
+        assert_eq!(TubeStats::from_yaml("---\ntotal-disconnects: 3\n").total_disconnects, 3);
+        assert_eq!(JobStats::from_yaml("---\ndisconnects: 2\n").disconnects, 2);
+        // Servers before tuber 0.17.0-dev.4 don't count them.
+        assert_eq!(TubeStats::from_yaml(PAUSED_TUBE).total_disconnects, 0);
     }
 
     #[test]

@@ -180,8 +180,8 @@ A real-time terminal dashboard for monitoring tuber queues.
 
 - Live server stats: version, uptime, connections, memory and disk headroom, drain status, and a red `WAL FAILED` when persistence has stopped and puts are being refused
 - Per-tube job counts in fixed, colour-coded columns — ready, urgent, reserved, delayed, held, buried — beside a log-scaled bar sizing each tube against the busiest
-- Throughput rates: puts/s, reserves/s, deletes/s, timeouts/s
-- A detail pane for whichever tube the cursor is on: bimodal processing EWMA, percentiles, oldest job ages, bury rate, `idp:` dedups (a dedup against a buried job in red), watcher counts
+- Throughput rates: puts/s, reserves/s, deletes/s, and the two ways a reserved job goes back to the queue without its worker saying so: timeouts/s (its TTR ran out) and disconnects/s (its worker's connection closed; tuber 0.17.0-dev.4 and later)
+- A detail pane for whichever tube the cursor is on: bimodal processing EWMA, percentiles, oldest job ages, bury rate, `idp:` dedups (a dedup against a buried job in red), jobs requeued by a timeout or a disconnect, watcher counts
 - Server totals as a footer row on the table, selectable like a tube to turn the pane over to the server
 - Queue growth indicators
 - Buried job highlighting
@@ -287,13 +287,14 @@ paused tube at zero is exactly the one you need to see.
 |▌   server     1.9M       1.9M    988    343     17   1.0K              |
 +------------------------------------------------------------------------+
 | Throughput: 0.2 puts/s  16.5 reserves/s  177.7 deletes/s  (2.2M total) |
-| Timeouts: 0.0/s  Buried: 1043 total                                    |
+| Timeouts: 0.0/s  Disconnects: 0.0/s  Buried: 1043 total                |
 | covers ----------------------------------------------------------------|
 | jobs     1.6M ready · 124 delayed · 23 buried                          |
 | runtime  79ms fast · 862ms slow · 100ms p50 · 1.3s p95 · 1.6s p99      |
 | oldest   4m12s ready · 1m3s delayed · 2d3h buried                      |
 | waiting  41.7m in queue · 8ms-4.2s over 1.2M runs · 0.02/s buried      |
-| clients  3 using · 5 watching · 0 waiting · 1.2M reserves · 4 timeouts |
+| requeued 4 timeouts · 2 disconnects                                    |
+| clients  3 using · 5 watching · 0 waiting · 1.2M reserves              |
 +------------------------------------------------------------------------+
 ```
 

@@ -1,6 +1,6 @@
 use crate::app::{
     flush_plan, format_secs, kick_plan, kick_target, parse_count, parse_duration, parse_scope,
-    plural, App, Mode, PromptKind, Selection,
+    plural, App, Mode, PromptKind, Selection, ServerRates,
 };
 use tuber_lib::model::{ServerStats, TubeStats};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -1032,7 +1032,7 @@ fn render_bottom_panel(
     frame: &mut Frame,
     app: &App,
     area: Rect,
-    rates: (f64, f64, f64, f64),
+    rates: ServerRates,
     detail: Vec<DetailLine>,
     detail_rows: usize,
 ) {
@@ -1043,13 +1043,11 @@ fn render_bottom_panel(
         return;
     };
 
-    let (puts_s, reserves_s, deletes_s, timeouts_s) = rates;
-
     let line1 = Line::from(vec![
         Span::styled(" Throughput: ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(
             "{:.1} puts/s  {:.1} reserves/s  {:.1} deletes/s",
-            puts_s, reserves_s, deletes_s
+            rates.puts, rates.reserves, rates.deletes
         )),
         Span::styled("  (", Style::default().fg(Color::DarkGray)),
         Span::raw(format!("{} total", format_number(snap.server.total_jobs))),
@@ -1068,7 +1066,9 @@ fn render_bottom_panel(
 
     let mut line2_spans = vec![
         Span::styled(" Timeouts: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{:.1}/s", timeouts_s)),
+        Span::raw(format!("{:.1}/s", rates.timeouts)),
+        Span::styled("  Disconnects: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{:.1}/s", rates.disconnects)),
         Span::styled("  Buried: ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{total_buried} total"), buried_style),
     ];
@@ -1177,6 +1177,28 @@ fn pair(value: String, label: &str) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+/// A TTR timeout and a closed connection: the two ways a reserved job goes
+/// back to the queue without its worker saying so. Each count that isn't 0,
+/// with its rate while it's moving; empty when neither has happened.
+///
+/// They share a line because they're read together. At the ends of other
+/// lines (`rates`, `commands`, `clients`) the pair ran past 80 columns.
+fn requeued_spans(counts: [(u64, f64, &str); 2]) -> Vec<Span<'static>> {
+    joined(
+        counts
+            .into_iter()
+            .filter(|(n, _, _)| *n > 0)
+            .map(|(n, rate, what)| {
+                let mut text = format!("{} {what}", format_number(n));
+                if rate > 0.0 {
+                    text.push_str(&format!(" ({rate:.1}/s)"));
+                }
+                vec![Span::styled(text, Style::default().fg(Color::Yellow))]
+            })
+            .collect(),
+    )
 }
 
 /// Everything worth knowing about one tube, in reading order — the lines that
@@ -1309,20 +1331,21 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
         lines.push(DetailLine { label: "waiting", spans: joined(queue) });
     }
 
+    // Jobs that went back to the queue without their worker saying so.
+    let requeued = requeued_spans([
+        (tube.total_timeouts, 0.0, "timeouts"),
+        (tube.total_disconnects, 0.0, "disconnects"),
+    ]);
+    if !requeued.is_empty() {
+        lines.push(DetailLine { label: "requeued", spans: requeued });
+    }
+
     // Who is attached, and what they have done.
     let clients = joined(vec![
         pair(tube.current_using.to_string(), "using"),
         pair(tube.current_watching.to_string(), "watching"),
         pair(tube.current_waiting.to_string(), "waiting"),
         pair(format_number(tube.total_reserves), "reserves"),
-        if tube.total_timeouts > 0 {
-            vec![Span::styled(
-                format!("{} timeouts", format_number(tube.total_timeouts)),
-                Style::default().fg(Color::Yellow),
-            )]
-        } else {
-            Vec::new()
-        },
     ]);
     lines.push(DetailLine { label: "clients", spans: clients });
 
@@ -1352,24 +1375,15 @@ fn tube_detail_lines(tube: &TubeStats) -> Vec<DetailLine> {
 /// body tallies, the command totals, the host triple — and to the fast/slow
 /// threshold, which is server configuration and so belongs here rather than
 /// restated on every tube's runtime line.
-fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec<DetailLine> {
+fn server_detail_lines(server: &ServerStats, rates: ServerRates) -> Vec<DetailLine> {
     let mut lines = Vec::new();
-    let (puts_s, reserves_s, deletes_s, timeouts_s) = rates;
 
     lines.push(DetailLine {
         label: "rates",
         spans: joined(vec![
-            pair(format!("{puts_s:.1}"), "puts/s"),
-            pair(format!("{reserves_s:.1}"), "reserves/s"),
-            pair(format!("{deletes_s:.1}"), "deletes/s"),
-            if timeouts_s > 0.0 {
-                vec![Span::styled(
-                    format!("{timeouts_s:.1} timeouts/s"),
-                    Style::default().fg(Color::Yellow),
-                )]
-            } else {
-                Vec::new()
-            },
+            pair(format!("{:.1}", rates.puts), "puts/s"),
+            pair(format!("{:.1}", rates.reserves), "reserves/s"),
+            pair(format!("{:.1}", rates.deletes), "deletes/s"),
         ]),
     });
 
@@ -1509,6 +1523,17 @@ fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec
         lines.push(DetailLine { label: "lost", spans: lost });
     }
 
+    // Jobs that went back to the queue without their worker saying so. Not
+    // lost, since they run again, but a worker that keeps dying or running
+    // past its TTR shows up here first.
+    let requeued = requeued_spans([
+        (server.job_timeouts, rates.timeouts, "timeouts"),
+        (server.job_disconnects, rates.disconnects, "disconnects"),
+    ]);
+    if !requeued.is_empty() {
+        lines.push(DetailLine { label: "requeued", spans: requeued });
+    }
+
     // Bodies of deleted jobs that startup dropped. TOAST deletes are index-only
     // until compaction rewrites the segment, so every restart finds them again:
     // a count of delete volume, not damage. The orphan and stranded passes
@@ -1548,14 +1573,6 @@ fn server_detail_lines(server: &ServerStats, rates: (f64, f64, f64, f64)) -> Vec
                 "reserves",
             ),
             pair(format_number(server.cmd_delete), "deletes"),
-            if server.job_timeouts > 0 {
-                vec![Span::styled(
-                    format!("{} timeouts", format_number(server.job_timeouts)),
-                    Style::default().fg(Color::Yellow),
-                )]
-            } else {
-                Vec::new()
-            },
         ]),
     });
 
@@ -2146,9 +2163,12 @@ mod tests {
         server.current_schedules = 10_000;
         server.current_schedules_size = 5_000_000;
         server.tcp_keepalive = 32_767;
+        server.job_disconnects = 1_234_567;
         let lines = draw_frame(&app, 80, 34);
-        let pane_labels =
-            ["rates", "memory", "schedule", "disk", "wal", "toast", "lost", "cleanup", "clients", "tuning"];
+        let pane_labels = [
+            "rates", "memory", "schedule", "disk", "wal", "toast", "lost", "requeued", "cleanup", "clients",
+            "tuning",
+        ];
         for label in pane_labels {
             let content = detail_line(&lines, label)
                 .unwrap_or_else(|| panic!("no {label} line:\n{}", lines.join("\n")));
@@ -2230,7 +2250,10 @@ mod tests {
         tube.total_idp_dedups_buried = 1;
         tube.pause = 60;
         tube.pause_time_left = 30;
-        let labels: Vec<&str> = server_detail_lines(&server, (1.0, 1.0, 1.0, 1.0))
+        let labels: Vec<&str> = server_detail_lines(
+            &server,
+            ServerRates { puts: 1.0, reserves: 1.0, deletes: 1.0, timeouts: 1.0, disconnects: 1.0 },
+        )
             .into_iter()
             .chain(tube_detail_lines(&tube))
             .map(|l| l.label)
@@ -2284,7 +2307,7 @@ mod tests {
         server.reclaimed_orphan_bodies = 25_296;
         server.reclaimed_stranded_bodies = 4;
 
-        let lines = server_detail_lines(&server, (0.0, 0.0, 0.0, 0.0));
+        let lines = server_detail_lines(&server, ServerRates::default());
         assert!(!lines.iter().any(|l| l.label == "repairs" || l.label == "lost"), "routine cleanup raised an alarm");
         let cleanup = lines.iter().find(|l| l.label == "cleanup").expect("no cleanup line");
         assert!(text(cleanup).contains("25.3K deleted bodies reclaimed"), "cleanup reads {:?}", text(cleanup));
@@ -2292,7 +2315,7 @@ mod tests {
 
         server.recovered_missing_bodies = 3;
         server.toast_bodies_dropped_corrupted = 2;
-        let lines = server_detail_lines(&server, (0.0, 0.0, 0.0, 0.0));
+        let lines = server_detail_lines(&server, ServerRates::default());
         let lost = lines.iter().find(|l| l.label == "lost").expect("no lost line");
         assert!(text(lost).contains("3 jobs, body missing"), "lost reads {:?}", text(lost));
         assert!(text(lost).contains("2 bodies corrupt"), "lost reads {:?}", text(lost));
@@ -2307,6 +2330,60 @@ mod tests {
         let lines = draw_frame(&app, 100, 34);
         assert!(detail_line(&lines, "schedule").is_none());
         assert!(detail_line(&lines, "memory").unwrap().contains("in jobs"));
+    }
+
+    /// A TTR timeout and a closed connection (tuber 0.17.0-dev.4) are the two
+    /// ways a reserved job goes back to the queue without its worker saying
+    /// so. They're read together, so they sit together, on a line of their
+    /// own: at the end of `rates` and `commands` the pair ran past 80 columns.
+    #[test]
+    fn the_server_pane_puts_disconnects_beside_timeouts() {
+        let server = |timeouts: u64, disconnects: u64| {
+            ServerStats::from_yaml(&format!(
+                "version: tuber 0.17.0-dev.4\ncmd-put: 9000\ncmd-reserve: 9000\n\
+                 cmd-delete: 9000\njob-timeouts: {timeouts}\njob-disconnects: {disconnects}\n"
+            ))
+        };
+        let t0 = Instant::now();
+        let mut app = App::new("test:11300".to_string());
+        app.update(Snapshot { server: server(10, 0), tubes: sample_tubes(), fetched_at: t0 });
+        app.update(Snapshot {
+            server: server(14, 6),
+            tubes: sample_tubes(),
+            fetched_at: t0 + std::time::Duration::from_secs(2),
+        });
+        app.selected = Some(Selection::Server);
+        let lines = draw_frame(&app, 80, 34);
+        let frame = lines.join("\n");
+
+        assert!(frame.contains(" Timeouts: 2.0/s  Disconnects: 3.0/s"), "stats bar:\n{frame}");
+        let requeued = detail_line(&lines, "requeued")
+            .unwrap_or_else(|| panic!("no requeued line:\n{frame}"));
+        assert_eq!(requeued, "14 timeouts (2.0/s) \u{00b7} 6 disconnects (3.0/s)");
+        assert!(!detail_line(&lines, "rates").unwrap().contains("timeouts"), "said twice");
+        assert!(!detail_line(&lines, "commands").unwrap().contains("timeouts"), "said twice");
+    }
+
+    #[test]
+    fn the_tube_pane_puts_disconnects_beside_timeouts() {
+        let tube = |extra: &str| {
+            TubeStats::from_yaml(&format!(
+                "name: covers\ncurrent-jobs-ready: 3\ncurrent-using: 3\ncurrent-watching: 5\n\
+                 total-reserves: 1200000\n{extra}"
+            ))
+        };
+        let pane = |t: TubeStats| draw_frame(&app_with_selection(vec![t], "covers"), 80, 24);
+
+        let lines = pane(tube("total-timeouts: 4\ntotal-disconnects: 2\n"));
+        let requeued = detail_line(&lines, "requeued")
+            .unwrap_or_else(|| panic!("no requeued line:\n{}", lines.join("\n")));
+        assert_eq!(requeued, "4 timeouts \u{00b7} 2 disconnects");
+        assert!(!detail_line(&lines, "clients").unwrap().contains("timeouts"), "said twice");
+
+        // Either alone still gets the line; neither, no line.
+        let lines = pane(tube("total-disconnects: 2\n"));
+        assert_eq!(detail_line(&lines, "requeued").as_deref(), Some("2 disconnects"));
+        assert!(detail_line(&pane(tube("")), "requeued").is_none());
     }
 
     /// A put whose `idp:` key matches a buried job queues nothing, and nothing
